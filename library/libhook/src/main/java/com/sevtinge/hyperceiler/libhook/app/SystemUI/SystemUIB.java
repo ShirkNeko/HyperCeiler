@@ -93,6 +93,7 @@ import com.sevtinge.hyperceiler.libhook.rules.systemui.statusbar.icon.all.WifiNe
 import com.sevtinge.hyperceiler.libhook.rules.systemui.statusbar.icon.b.HideBatteryIconB;
 import com.sevtinge.hyperceiler.libhook.rules.systemui.statusbar.icon.v.WifiStandard;
 import com.sevtinge.hyperceiler.libhook.rules.systemui.statusbar.island.HideStrongToast;
+import com.sevtinge.hyperceiler.libhook.rules.systemui.statusbar.island.UnlockFocus;
 import com.sevtinge.hyperceiler.libhook.rules.systemui.statusbar.mobile.DualRowSignalHookV;
 import com.sevtinge.hyperceiler.libhook.rules.systemui.statusbar.mobile.MobilePublicHookV;
 import com.sevtinge.hyperceiler.libhook.rules.systemui.statusbar.mobile.MobileTypeSingle2Hook;
@@ -165,6 +166,11 @@ public class SystemUIB extends BaseLoad {
             initHook(FocusNotifLyric.INSTANCE);
             initHook(HideFakeStatusBar.INSTANCE, PrefsBridge.getBoolean("system_ui_statusbar_music_hide_clock") && !isPad());
         }*/
+
+        if (PrefsBridge.getBoolean("system_ui_unlock_all_focus")) {
+            initHook(new UnlockFocus());
+        }
+
 
         // 灵动舞台
         initHook(HideStrongToast.INSTANCE, PrefsBridge.getBoolean("system_ui_status_bar_hide_smart_strong_toast"));

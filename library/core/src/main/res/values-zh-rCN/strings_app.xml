@@ -882,6 +882,7 @@
     <string name="system_ui_control_center_hide_name">隐藏全部名称</string>
     <string name="system_ui_control_center_hide_display_device_name">显示设备名称</string>
     <string name="system_ui_control_center_unlock_all_focus">移除焦点通知白名单</string>
+    <string name="system_ui_focus_notification_list">配置焦点通知列表</string>
     <string name="system_ui_control_center_remove_notif_num_limit">移除通知数量限制</string>
     <string name="system_ui_control_center_remove_notif_num_limit_desc">允许显示 10 条或 17 条及以上的通知</string>
     <string name="system_ui_control_center_opt_notification_element_background_color">优化焦点通知背景混色</string>

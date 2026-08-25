@@ -16,9 +16,10 @@ class UnlockFocus : BaseHook() {
     override fun init() {
 
         XposedLog.d(TAG, "UnlockFocus init")
-        val a = loadClassOrNull("com.miui.systemui.notification.NotificationSettingsManager")
+        val NotificationSettingsManager =
+            loadClassOrNull("com.miui.systemui.notification.NotificationSettingsManager")
 
-        a?.findMethod {
+        NotificationSettingsManager?.findMethod {
             name("canShowFocusState")
         }
             ?.createAfterHook {
@@ -28,7 +29,7 @@ class UnlockFocus : BaseHook() {
                 }
             }
 
-        a?.findMethod {
+        NotificationSettingsManager?.findMethod {
             name("canShowFocusStateApp")
         }
             ?.createAfterHook {

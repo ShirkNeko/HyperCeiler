@@ -239,6 +239,33 @@ object BatteryDetailIndicator : BaseHook() {
                 }
             }
         }
+
+        runCatching {
+            nsvCls.declaredMethods.filter {
+                it.name in listOf("onDarkChanged", "onLightDarkTintChanged", "onDarkChangedWithContrast")
+            }.createAfterHooks { param ->
+                val nsView = param.thisObject as? View
+                if (nsView != null && ViewHelper.isCustomTextIcon(nsView)) {
+                    syncColorWithClock(nsView)
+                }
+            }
+        }
+    }
+
+    private fun syncColorWithClock(iconView: View, clockView: TextView? = null) {
+        val clock = clockView
+            ?: (iconView.parent as? ViewGroup)?.let { container ->
+                val clockId = container.resources.getIdentifier(ID_CLOCK, "id", PKG_SYSTEMUI)
+                if (clockId != 0) container.findViewById<TextView>(clockId) else null
+            }
+        val number = iconView.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT)
+            ?: (iconView as? TextView)
+        if (number != null && clock != null) {
+            val colors = clock.textColors
+            if (colors != null) {
+                number.setTextColor(colors)
+            }
+        }
     }
 
     private fun startDataCollection() {
@@ -271,6 +298,7 @@ object BatteryDetailIndicator : BaseHook() {
                             ?: (tv as? TextView)
                         number?.text = tii.iconText
                     }
+                syncColorWithClock(tv)
             }
         }
     }
@@ -410,6 +438,7 @@ object BatteryDetailIndicator : BaseHook() {
     private object LeftSideHookHelper {
         fun setup(nsvCls: Class<*>) {
             setupCollapsedStatusBar(nsvCls)
+            setupStatusBarViewController(nsvCls)
             setupSystemIconAreaVisibility()
         }
 
@@ -433,36 +462,111 @@ object BatteryDetailIndicator : BaseHook() {
             }
         }
 
-        private fun injectToCollapsedStatusBar(nsvCls: Class<*>, fragment: Any, rootView: View?, context: Context) {
-            val darkDispatcher = loadClassOrNull("com.android.systemui.plugins.DarkIconDispatcher", lpparam.classLoader)?.let { darkCls ->
-                loadClassOrNull("com.android.systemui.Dependency", lpparam.classLoader)?.let { depCls ->
-                    runCatching { depCls.callStaticMethod("get", darkCls) }.getOrNull()
+        private fun setupStatusBarViewController(nsvCls: Class<*>) {
+            val controllerCls = loadClassOrNull("com.android.systemui.statusbar.phone.PhoneStatusBarViewController", lpparam.classLoader)
+            if (controllerCls != null) {
+                runCatching {
+                    controllerCls.declaredMethods.filter { it.name == "onViewAttached" && it.parameterCount == 0 }.createAfterHooks { param ->
+                        val controller = param.thisObject
+                        val clockView = controller.getObjectFieldOrNullAs<View>("clock")
+                            ?: controller.getObjectFieldOrNullAs<View>(FIELD_M_CLOCK_VIEW)
+                        val startSideContainer = controller.getObjectFieldOrNullAs<ViewGroup>("startSideContainer")
+                        val darkDispatcher = controller.getObjectFieldOrNull("darkIconDispatcher")
+                        val context = clockView?.context ?: startSideContainer?.context
+                        if (context != null) {
+                            injectToContainer(nsvCls, context, clockView, startSideContainer, darkDispatcher)
+                        }
+                    }
+                }.onFailure {
+                    XposedLog.e(HOOK_TAG, lpparam.packageName, "Failed to hook PhoneStatusBarViewController.onViewAttached: ${it.message}")
                 }
             }
 
+            val miuiStatusBarViewCls = loadClassOrNull("com.android.systemui.statusbar.phone.MiuiPhoneStatusBarView", lpparam.classLoader)
+                ?: loadClassOrNull("com.android.systemui.statusbar.phone.PhoneStatusBarView", lpparam.classLoader)
+            if (miuiStatusBarViewCls != null) {
+                runCatching {
+                    miuiStatusBarViewCls.declaredMethods.filter {
+                        (it.name == "onFinishInflate" || it.name == "onAttachedToWindow") && it.parameterCount == 0
+                    }.createAfterHooks { param ->
+                        val view = param.thisObject as? ViewGroup
+                        if (view != null) {
+                            val clockId = view.resources.getIdentifier(ID_CLOCK, "id", PKG_SYSTEMUI)
+                            val clockView = if (clockId != 0) view.findViewById<View>(clockId) else null
+                            val container = (clockView?.parent as? ViewGroup)
+                            if (container != null) {
+                                injectToContainer(nsvCls, view.context, clockView, container, null)
+                            }
+                        }
+                    }
+                }.onFailure {
+                    XposedLog.e(HOOK_TAG, lpparam.packageName, "Failed to hook MiuiPhoneStatusBarView: ${it.message}")
+                }
+            }
+
+            val miuiClockCls = loadClassOrNull("com.android.systemui.statusbar.views.MiuiClock", lpparam.classLoader)
+                ?: loadClassOrNull("com.android.systemui.statusbar.views.MiuiStatusBarClock", lpparam.classLoader)
+            if (miuiClockCls != null) {
+                runCatching {
+                    miuiClockCls.declaredMethods.filter {
+                        it.name in listOf("setTextColor", "setTextColorDark", "updateClockColor", "onDarkChanged", "setTextDark", "updateTime")
+                    }.createAfterHooks { param ->
+                        val clock = param.thisObject as? TextView
+                        if (clock != null) {
+                            for (tv in mStatusbarTextIcons) {
+                                syncColorWithClock(tv, clock)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private fun injectToCollapsedStatusBar(nsvCls: Class<*>, fragment: Any, rootView: View?, context: Context) {
             val clockView = fragment.getObjectFieldOrNullAs<View>(FIELD_M_CLOCK_VIEW)
                 ?: rootView?.let { root ->
                     val clockId = root.resources.getIdentifier(ID_CLOCK, "id", PKG_SYSTEMUI)
                     if (clockId != 0) root.findViewById(clockId) else null
                 }
-
             val container = clockView?.parent as? ViewGroup
-            if (container != null) {
-                val existing = container.findViewWithTag<View>(TAG_SLOT_TEXT_ICON)
-                if (existing != null) {
-                    if (!mStatusbarTextIcons.contains(existing)) {
-                        mStatusbarTextIcons.add(existing)
-                    }
-                } else {
-                    val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT)
-                    val iconView = ViewHelper.createStatusbarTextIcon(nsvCls, context, lp, false)
-                    val index = (container.indexOfChild(clockView) + 1).coerceAtLeast(0).coerceAtMost(container.childCount)
-                    container.addView(iconView, index)
-                    mStatusbarTextIcons.add(iconView)
-                    if (darkDispatcher != null) {
-                        runCatching { darkDispatcher.callMethod(METHOD_ADD_DARK_RECEIVER, iconView) }
-                    }
+            injectToContainer(nsvCls, context, clockView, container, null)
+        }
+
+        private fun injectToContainer(
+            nsvCls: Class<*>,
+            context: Context,
+            clockView: View?,
+            targetContainer: ViewGroup?,
+            providedDarkDispatcher: Any?
+        ) {
+            val container = targetContainer ?: (clockView?.parent as? ViewGroup) ?: return
+            val existing = container.findViewWithTag<View>(TAG_SLOT_TEXT_ICON)
+            if (existing != null) {
+                if (!mStatusbarTextIcons.contains(existing)) {
+                    mStatusbarTextIcons.add(existing)
                 }
+                syncColorWithClock(existing, clockView as? TextView)
+                return
+            }
+
+            val darkDispatcher = providedDarkDispatcher ?: loadClassOrNull("com.android.systemui.plugins.DarkIconDispatcher", lpparam.classLoader)?.let { darkCls ->
+                loadClassOrNull("com.android.systemui.Dependency", lpparam.classLoader)?.let { depCls ->
+                    runCatching { depCls.callStaticMethod("get", darkCls) }.getOrNull()
+                }
+            }
+
+            val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            val iconView = ViewHelper.createStatusbarTextIcon(nsvCls, context, lp, false)
+            val index = if (clockView != null) {
+                (container.indexOfChild(clockView) + 1).coerceAtLeast(0).coerceAtMost(container.childCount)
+            } else {
+                container.childCount
+            }
+            container.addView(iconView, index)
+            mStatusbarTextIcons.add(iconView)
+            syncColorWithClock(iconView, clockView as? TextView)
+            if (darkDispatcher != null) {
+                runCatching { darkDispatcher.callMethod(METHOD_ADD_DARK_RECEIVER, iconView) }
             }
         }
 
@@ -648,6 +752,12 @@ object BatteryDetailIndicator : BaseHook() {
             runCatching { iconView.setObjectField(FIELD_NETWORK_SPEED_NUMBER_TEXT, number) }
             runCatching { iconView.setObjectField(FIELD_NETWORK_SPEED_UNIT_TEXT, unit) }
             runCatching { iconView.setObjectField(FIELD_VISIBLE_BY_CONTROLLER, true) }
+            runCatching {
+                iconView.javaClass.declaredMethods.filter { it.name.startsWith("updateResources") }.forEach {
+                    it.isAccessible = true
+                    it.invoke(iconView)
+                }
+            }
 
             initStatusbarTextIcon(mContext, lp, iconView, fromController)
             return iconView
@@ -677,6 +787,7 @@ object BatteryDetailIndicator : BaseHook() {
             if (styleId != 0) {
                 iconTextView.setTextAppearance(styleId)
             }
+            syncColorWithClock(iconView)
 
             val familyName = if (bold) FONT_MIPRO_BOLD else FONT_MIPRO_MEDIUM
             val tf = runCatching { Typeface.create(familyName, if (bold) Typeface.BOLD else Typeface.NORMAL) }.getOrNull()

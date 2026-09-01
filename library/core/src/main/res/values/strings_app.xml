@@ -714,6 +714,7 @@
     <string name="system_ui_status_bar_battery_style_font_size">Battery percentage font size</string>
     <string name="system_ui_status_bar_battery_style_font_mark_size">Battery percentage symbol font size</string>
     <string name="system_ui_status_bar_battery_style_vertical_offset">Up and down offset of battery percentage symbol</string>
+    <string name="system_ui_statusbar_battery_detail">Battery info</string>
     <string name="system_ui_statusbar_battery_detail_title">Display battery info</string>
     <string name="system_ui_statusbar_battery_detail_enable">Display battery info</string>
     <string name="system_ui_statusbar_battery_detail_content_title">Display content</string>

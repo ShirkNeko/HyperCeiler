@@ -726,6 +726,7 @@
     <string name="system_ui_status_bar_battery_charging">隐藏充电指示器</string>
     <string name="system_ui_status_bar_battery_icon">隐藏电池图标</string>
     <string name="system_ui_status_bar_battery_style_title">电池自定义</string>
+    <string name="system_ui_statusbar_battery_detail">电池信息</string>
     <string name="system_ui_statusbar_battery_detail_title">显示电池信息</string>
     <string name="system_ui_statusbar_battery_detail_enable">显示电池信息</string>
     <string name="system_ui_statusbar_battery_detail_content_title">显示内容</string>

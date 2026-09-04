@@ -35,6 +35,8 @@ final class DockDiagnosticJournal {
             }
             previous = bounded.toString();
             prefs.edit().putString("events", previous).apply();
+            // Acknowledge a write without copying the full history over Binder again.
+            return Bundle.EMPTY;
         }
         Bundle result = new Bundle();
         result.putString("events", previous);

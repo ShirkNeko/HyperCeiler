@@ -13,6 +13,10 @@
 #include <cstring>
 #include <string_view>
 
+#ifdef HYPERCEILER_DOCK_NATIVE_OBSERVER
+void start_dock_native_probe(int (*hook)(void *, void *, void **));
+#endif
+
 namespace {
 
 constexpr char kLogTag[] = "HyperCeilerHomeNative";
@@ -125,6 +129,9 @@ NativeOnModuleLoaded native_init(const NativeApiEntries *entries) {
     // Install before libapp_launcher/libapp run their static initialization and cache the
     // properties. The load callback remains as a retry path for unusual linker ordering.
     install_property_hook();
+#ifdef HYPERCEILER_DOCK_NATIVE_OBSERVER
+    start_dock_native_probe(g_hook_function);
+#endif
     return on_library_loaded;
 }
 

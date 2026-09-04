@@ -8,6 +8,7 @@ import android.graphics.Color
 import android.graphics.Rect
 import android.os.Handler
 import android.os.Bundle
+import android.os.IBinder
 import android.os.SystemClock
 import android.view.Choreographer
 import android.view.WindowManager
@@ -39,8 +40,14 @@ class HomeDockWindow : BaseHook() {
     private data class Layer(val parent: Any, val effect: Any, val tint: Any,
         var appearance: String = "", var glass: DockGlassClient.Ticket? = null,
         val motion: DockRecentsMotion = DockRecentsMotion(),
+        val nativeMotion: DockNativeMotion = DockNativeMotion(),
+        var nativeClient: DockNativeMotionClient? = null,
+        var nativeApplied: Boolean = false, var overview: Boolean = false,
+        var nativeScene: Int = -1,
         var lastGlassReady: Boolean? = null,
+        var motionSession: Any? = null, var motionClient: IBinder? = null,
         var motionSamples: Int = 0, var motionEndPending: Boolean = false,
+        var baseY: Int = 0, var density: Float = 0f, var motionTime: Long = 0,
         var x: Float = Float.NaN, var y: Float = Float.NaN)
     private val layers = IdentityHashMap<Any, Layer>()
     private val observed = HashSet<String>()
@@ -52,10 +59,15 @@ class HomeDockWindow : BaseHook() {
     private val glassClient = DockGlassClient { requestTraversal() }
     private val frameScheduled = AtomicBoolean(false)
     @Volatile private var animationAvailable = true
+    @Volatile private var directMotionAvailable = true
     @Volatile private var animationChoreographer: Choreographer? = null
-    private val animationFrame = Choreographer.FrameCallback {
+    // Owned and used only on WMS's handler thread, never the host window transaction.
+    private var motionTransaction: Any? = null
+    private val animationFrame = Choreographer.FrameCallback { frameTimeNanos ->
         frameScheduled.set(false)
-        if (!stopped) requestTraversal()
+        if (!stopped) {
+            if (directMotionAvailable) updateMotionFrame(frameTimeNanos) else requestTraversal()
+        }
     }
 
     private fun readSettings() = Settings(
@@ -70,7 +82,7 @@ class HomeDockWindow : BaseHook() {
     )
 
     override fun init() {
-        glassClient.record("hook init diagnosticVersion=1 enabled=${settings.enabled} mode=${settings.mode}")
+        glassClient.record("hook init diagnosticVersion=7 enabled=${settings.enabled} mode=${settings.mode}")
         val windowClass = loadClass("com.android.server.wm.WindowState")
         val attrsField = windowClass.getDeclaredField("mAttrs").apply { isAccessible = true }
         val prepare = windowClass.getDeclaredMethod("prepareSurfaces").apply { isAccessible = true }
@@ -90,6 +102,8 @@ class HomeDockWindow : BaseHook() {
             glassClient.close()
             service?.getObjectFieldAs<Handler>("mH")?.post {
                 runCatching { animationChoreographer?.removeFrameCallback(animationFrame) }
+                runCatching { motionTransaction?.callMethod("close") }
+                motionTransaction = null
                 animationChoreographer = null
                 frameScheduled.set(false)
             }
@@ -125,51 +139,61 @@ class HomeDockWindow : BaseHook() {
         // Do not change the command, wallpaper, launcher surface or gesture handling.
         runCatching {
             val controller = loadClass("com.android.server.wm.WallpaperController")
-            val signature = arrayOf(windowClass, String::class.java, Int::class.javaPrimitiveType,
-                Int::class.javaPrimitiveType, Int::class.javaPrimitiveType,
-                Bundle::class.java, Boolean::class.javaPrimitiveType)
-            val command = controller.declaredMethods.firstOrNull {
-                it.name == "sendWindowWallpaperCommandUnchecked" && it.parameterTypes.contentEquals(signature)
-            } ?: controller.declaredMethods.firstOrNull {
-                it.name == "sendWindowWallpaperCommand" && it.parameterTypes.contentEquals(signature)
-            } ?: error("No window-scoped wallpaper command endpoint")
+            val endpoint = DockWallpaperEndpoint.resolve(controller, windowClass,
+                loadClass("com.android.server.wm.Session"), IBinder::class.java, Bundle::class.java)
+            val command = endpoint.method()
             command.isAccessible = true
             command.createAfterHook { param ->
                 if (stopped || !settings.enabled) return@createAfterHook
                 // Animation compatibility must not disable an otherwise working background.
                 runCatching {
-                    val window = param.args[0] ?: return@runCatching
-                    val attrs = attrsField.get(window) as WindowManager.LayoutParams
-                    if (!DockWindowPolicy.isLauncherWindow(attrs.packageName, attrs.title.toString(),
-                            attrs.type, window.callMethod("getDisplayId") as Int)) return@runCatching
-                    synchronized(layers) {
-                        if (commandSamples++ < 12) {
-                            val bundle = param.args[5] as? Bundle
+                    val wm = service ?: return@runCatching
+                    // Session callbacks may run after WMS releases its lock. Always acquire
+                    // the WM lock before our layer lock, matching prepareSurfaces lock order.
+                    synchronized(wm.getObjectFieldAs<Any>("mGlobalLock")) {
+                        synchronized(layers) {
+                            if (stopped || !settings.enabled) return@runCatching
+                            val window = if (endpoint.sessionScoped()) {
+                                layers.entries.firstOrNull { (_, layer) ->
+                                    DockWallpaperEndpoint.ownsWindow(layer.motionSession, layer.motionClient,
+                                        param.thisObject, param.args[0])
+                                }?.key ?: return@runCatching
+                            } else param.args[0] ?: return@runCatching
+                            val attrs = attrsField.get(window) as WindowManager.LayoutParams
+                            if (!DockWindowPolicy.isLauncherWindow(attrs.packageName, attrs.title.toString(),
+                                    attrs.type, window.callMethod("getDisplayId") as Int)) return@runCatching
+                            val extras = param.args[5] as? Bundle
                             @Suppress("DEPRECATION")
-                            val value = bundle?.get("scale_to")
-                            glassClient.record("launcher wallpaper command=${(param.args[1] as? String)?.take(80)} " +
-                                "action=${bundle?.getString("action")?.take(40)} " +
-                                "scale=${(value as? Number)?.toDouble()} type=${value?.javaClass?.simpleName}")
-                        }
-                    }
-                    if (param.args[1] != DockRecentsMotion.WALLPAPER_ACTION) return@runCatching
-                    val extras = param.args[5] as? Bundle ?: return@runCatching
-                    @Suppress("DEPRECATION")
-                    val scale = (extras.get("scale_to") as? Number)?.toDouble() ?: return@runCatching
-                    val overview = DockRecentsMotion.overviewTarget(param.args[1] as String,
-                        extras.getString("action"), scale) ?: return@runCatching
-                    synchronized(layers) {
-                        if (stopped || !settings.enabled) return@synchronized
-                        service = window.getObjectFieldAs<Any>("mWmService")
-                        // An enter-recents command can precede the first prepareSurfaces.
-                        if (layers[window] == null) updateLayer(window)
-                        val layer = layers[window] ?: return@synchronized
-                        if (layer.motion.setOverview(overview, SystemClock.uptimeMillis())) {
-                            layer.motionSamples = 0
-                            layer.motionEndPending = true
-                            glassClient.record("motion target overview=$overview liftDp=${DockRecentsMotion.LIFT_DP}")
-                            XposedLog.i(TAG, "system", "Dock recents motion: overview=$overview, liftDp=${DockRecentsMotion.LIFT_DP}")
-                            requestTraversal()
+                            val value = extras?.get("scale_to")
+                            if (commandSamples++ < 12) {
+                                glassClient.record("launcher wallpaper command=${(param.args[1] as? String)?.take(80)} " +
+                                    "action=${extras?.getString("action")?.take(40)} " +
+                                    "scale=${(value as? Number)?.toDouble()} type=${value?.javaClass?.simpleName}")
+                            }
+                            if (param.args[1] != DockRecentsMotion.WALLPAPER_ACTION || extras == null) return@runCatching
+                            val scale = (value as? Number)?.toDouble() ?: return@runCatching
+                            val overview = DockRecentsMotion.overviewTarget(param.args[1] as String,
+                                extras.getString("action"), scale) ?: return@runCatching
+                            // A controller command can precede the first prepareSurfaces.
+                            if (layers[window] == null) {
+                                updateLayer(window)
+                                // Commit initial parent/crop/visibility even when motion uses VSync directly.
+                                requestTraversal()
+                            }
+                            val layer = layers[window] ?: return@runCatching
+                            layer.overview = overview
+                            val now = SystemClock.uptimeMillis()
+                            layer.motionTime = now
+                            val immediate = extras.getString("action") == "setTo"
+                            val wasRunning = layer.motion.isRunning(now)
+                            val targetChanged = layer.motion.setOverview(overview, now)
+                            if (immediate) layer.motion.finish()
+                            if (layer.nativeClient?.connected != true && (targetChanged || (immediate && wasRunning))) {
+                                layer.motionSamples = 0
+                                layer.motionEndPending = true
+                                glassClient.record("motion target overview=$overview immediate=$immediate scale=$scale liftDp=${DockRecentsMotion.LIFT_DP} curve=sceneSpring")
+                                if (directMotionAvailable) scheduleAnimationFrame() else requestTraversal()
+                            }
                         }
                     }
                 }.onFailure {
@@ -213,6 +237,17 @@ class HomeDockWindow : BaseHook() {
             }
             layer = Layer(parent, effect, tint)
             layers[window] = layer
+            val motionLayer = layer
+            runCatching {
+                motionLayer.motionSession = window.getObjectFieldAs<Any>("mSession")
+                motionLayer.motionClient = window.getObjectFieldAs<Any>("mClient").callMethod("asBinder") as IBinder
+                glassClient.record("motion window identity bound")
+            }.onFailure {
+                // An optional Session fallback must never disable the glass background.
+                motionLayer.motionSession = null
+                motionLayer.motionClient = null
+                glassClient.record("motion window identity unavailable=${it.javaClass.simpleName}")
+            }
             XposedLog.i(TAG, "system", "Dock surface created: frame=$frame, bounds=$bounds, blur=${config.blur}")
             if (!config.blur && Color.alpha(config.color) == 0) {
                 XposedLog.w(TAG, "system", "Dock color is transparent; select a visible color or enable blur")
@@ -224,6 +259,7 @@ class HomeDockWindow : BaseHook() {
             else -> configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
         }
         val visible = window.callMethod("isVisible") == true
+        bindNativeMotion(layer, visible)
         if (!visible || !animationAvailable) layer.motion.finish()
         val glassKey = "${bounds.width()}/${bounds.height()}/${bounds.radius()}/$dark"
         if (!config.glass || layer.glass?.key?.let { it != glassKey } == true) {
@@ -240,8 +276,18 @@ class HomeDockWindow : BaseHook() {
         val appearance = "$config/$bounds/$dark/$visible/$glassSurface/$glassReady/${glass?.dead}"
         val now = SystemClock.uptimeMillis()
         val x = bounds.x().toFloat()
-        val y = bounds.y() + layer.motion.offsetY(configuration.densityDpi / 160f, bounds.y(), now)
-        if (visible && layer.motion.isRunning(now)) scheduleAnimationFrame()
+        val density = configuration.densityDpi / 160f
+        val geometryChanged = layer.x != x || layer.baseY != bounds.y() || layer.density != density
+        layer.baseY = bounds.y()
+        layer.density = density
+        layer.motionTime = now
+        val offset = motionOffset(layer, now)
+        val running = !layer.nativeApplied && layer.motion.isRunning(now)
+        // In direct mode, do not queue old animation positions in a later WMS traversal.
+        // WMS still initializes/repositions our layer when the actual layout changes.
+        val y = if (directMotionAvailable && visible && running && !geometryChanged) layer.y
+            else bounds.y() + offset
+        if (visible && running) scheduleAnimationFrame()
         val moved = layer.x != x || layer.y != y
         if (!moved && layer.appearance == appearance) return
         val transaction = window.callMethod("getSyncTransaction")!!
@@ -251,11 +297,7 @@ class HomeDockWindow : BaseHook() {
             transaction.callMethod("setPosition", layer.effect, x, y)
             layer.x = x
             layer.y = y
-            if (layer.motionEndPending && (layer.motionSamples < 2 || !layer.motion.isRunning(now))) {
-                glassClient.record("motion position offsetY=${y - bounds.y()} running=${layer.motion.isRunning(now)} visible=$visible")
-                layer.motionSamples++
-                if (!layer.motion.isRunning(now)) layer.motionEndPending = false
-            }
+            recordMotion(layer, y, now, visible, "layout")
         }
         if (layer.appearance == appearance) return
         transaction.callMethod("setLayer", layer.effect, -1)
@@ -327,6 +369,8 @@ class HomeDockWindow : BaseHook() {
 
     private fun removeLayer(window: Any) {
         val layer = layers.remove(window) ?: return
+        layer.nativeClient?.close()
+        layer.nativeClient = null
         layer.glass?.let { glassClient.release(it) }
         // Only release surfaces created by this hook. Never release the host's parent handle.
         runCatching { destroySurface(layer.tint) }
@@ -346,14 +390,129 @@ class HomeDockWindow : BaseHook() {
         }
     }
 
+    private fun recordMotion(layer: Layer, y: Float, now: Long, visible: Boolean, source: String) {
+        val running = if (layer.nativeApplied) {
+            val progress = layer.nativeMotion.progress()
+            progress > 0.001f && kotlin.math.abs(progress - 1f) > 0.001f
+        } else layer.motion.isRunning(now)
+        if (layer.motionEndPending && (layer.motionSamples < 6 || !running)) {
+            glassClient.record("motion position offsetY=${y - layer.baseY} running=$running visible=$visible source=${if (layer.nativeApplied) "native-$source" else source}")
+            layer.motionSamples++
+            if (!running) layer.motionEndPending = false
+        }
+    }
+
+    private fun updateMotionFrame(frameTimeNanos: Long) {
+        val wm = service ?: return
+        runCatching {
+            synchronized(wm.getObjectFieldAs<Any>("mGlobalLock")) {
+                synchronized(layers) {
+                    if (stopped || !settings.enabled) return@runCatching
+                    var needsFrame = false
+                    val updates = ArrayList<Pair<Layer, Float>>()
+                    for ((window, layer) in layers) {
+                        if (window.callMethod("isVisible") != true || layer.effect.callMethod("isValid") != true) {
+                            layer.motion.finish()
+                            continue
+                        }
+                        val now = DockRecentsMotion.frameTimeMillis(frameTimeNanos, layer.motionTime)
+                        layer.motionTime = now
+                        val y = layer.baseY + motionOffset(layer, now)
+                        if (!layer.nativeApplied && layer.motion.isRunning(now)) needsFrame = true
+                        if (layer.x.isFinite() && layer.baseY > 0 && y != layer.y) updates.add(layer to y)
+                    }
+                    if (updates.isNotEmpty()) {
+                        val transaction = motionTransaction ?: loadClass("android.view.SurfaceControl\$Transaction")
+                            .getConstructor().newInstance().also { motionTransaction = it }
+                        for ((layer, y) in updates) transaction.callMethod("setPosition", layer.effect, layer.x, y)
+                        transaction.callMethod("setAnimationTransaction")
+                        transaction.callMethod("setFrameTimelineVsync", animationChoreographer!!.callMethod("getVsyncId") as Long)
+                        transaction.callMethod("apply")
+                        // Publish cached positions only after a successful submission.
+                        for ((layer, y) in updates) {
+                            layer.y = y
+                            recordMotion(layer, y, layer.motionTime, true, "vsync")
+                        }
+                    }
+                    if (needsFrame) scheduleAnimationFrame()
+                }
+            }
+        }.onFailure {
+            // Optional direct scheduling must not disable the background or touch host surfaces.
+            directMotionAvailable = false
+            runCatching { motionTransaction?.callMethod("close") }
+            motionTransaction = null
+            glassClient.record("motion direct frame unavailable=${it.javaClass.simpleName}; using traversal fallback")
+            requestTraversal()
+        }
+    }
+
+    private fun bindNativeMotion(layer: Layer, visible: Boolean) {
+        if (!visible) {
+            layer.nativeClient?.close()
+            layer.nativeClient = null
+            layer.nativeMotion.reset()
+            layer.nativeApplied = false
+            layer.nativeScene = -1
+            return
+        }
+        if (layer.nativeClient != null) return
+        val session = layer.motionSession ?: return
+        runCatching {
+            val uid = session.getObjectFieldAs<Int>("mUid")
+            val pid = session.getObjectFieldAs<Int>("mPid")
+            if (uid < 10000 || pid <= 0) return@runCatching
+            layer.nativeClient = DockNativeMotionClient(uid, pid, {
+                if (directMotionAvailable) scheduleAnimationFrame() else requestTraversal()
+            }, glassClient::record).also { it.start() }
+        }.onFailure {
+            if (observed.add("native-motion-identity")) {
+                glassClient.record("native motion identity unavailable=${it.javaClass.simpleName}")
+            }
+        }
+    }
+
+    // Called only under the layer lock. The socket worker publishes an immutable
+    // latest sample; intermediate queued values never become a second animation.
+    private fun motionOffset(layer: Layer, now: Long): Float {
+        val client = layer.nativeClient
+        val sample = client?.latest
+        if (client?.connected == true && sample != null) {
+            layer.nativeMotion.accept(sample)
+            layer.nativeApplied = true
+            if (sample.scene() != layer.nativeScene) {
+                layer.nativeScene = sample.scene()
+                layer.motionSamples = 0
+                layer.motionEndPending = true
+                glassClient.record("native motion scene=${sample.scene()} scale=${sample.scale()}")
+            }
+            return layer.nativeMotion.offsetY(layer.density, layer.baseY)
+        }
+        if (layer.nativeApplied) {
+            layer.motion.resumeFrom(layer.nativeMotion.progress(), layer.overview, now)
+            layer.nativeApplied = false
+            layer.nativeMotion.reset()
+            layer.nativeScene = -1
+            layer.motionSamples = 0
+            layer.motionEndPending = true
+            glassClient.record("native motion disconnected; resuming scene fallback")
+        }
+        return layer.motion.offsetY(layer.density, layer.baseY, now)
+    }
+
     private fun scheduleAnimationFrame() {
         val wm = service ?: return
         if (stopped || !frameScheduled.compareAndSet(false, true)) return
         wm.getObjectFieldAs<Handler>("mH").post {
             if (stopped) frameScheduled.set(false)
             else runCatching {
-                val choreographer = animationChoreographer ?: Choreographer.getInstance().also {
+                val choreographer = animationChoreographer ?: run {
+                    // Match compositor scheduling, instead of adding another app-frame/traversal hop.
+                    runCatching { Choreographer::class.java.getDeclaredMethod("getSfInstance").invoke(null) as Choreographer }
+                        .getOrElse { Choreographer.getInstance() }
+                }.also {
                     animationChoreographer = it
+                    glassClient.record("motion frame clock ready direct=$directMotionAvailable")
                 }
                 choreographer.postFrameCallback(animationFrame)
             }.onFailure {

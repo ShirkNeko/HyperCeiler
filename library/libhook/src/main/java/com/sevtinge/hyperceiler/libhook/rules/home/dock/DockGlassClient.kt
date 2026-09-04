@@ -2,6 +2,7 @@
 package com.sevtinge.hyperceiler.libhook.rules.home.dock
 
 import android.content.Context
+import android.content.ContentProviderClient
 import android.net.Uri
 import android.os.Binder
 import android.os.Bundle
@@ -30,6 +31,7 @@ internal class DockGlassClient(private val changed: () -> Unit) {
         var death: IBinder.DeathRecipient? = null
         var attempts = 0
         var recoveryPending = false
+        var client: ContentProviderClient? = null
     }
 
     private val owner = Binder()
@@ -41,6 +43,11 @@ internal class DockGlassClient(private val changed: () -> Unit) {
     @Volatile private var closed = false
     @Volatile private var diagnosticContext: Context? = null
     private val events = ArrayDeque<String>() // IPC worker only; no frame-by-frame history.
+    private var diagnosticFlushScheduled = false
+    private val diagnosticFlush = Runnable {
+        diagnosticFlushScheduled = false
+        flushDiagnostics()
+    }
 
     fun bindDiagnostics(context: Context) {
         if (diagnosticContext != null || closed) return
@@ -56,7 +63,10 @@ internal class DockGlassClient(private val changed: () -> Unit) {
         worker.post {
             if (events.size >= 96) events.removeFirst()
             events.addLast(message)
-            flushDiagnostics()
+            if (!diagnosticFlushScheduled) {
+                diagnosticFlushScheduled = true
+                worker.postDelayed(diagnosticFlush, 250)
+            }
         }
     }
 
@@ -168,7 +178,11 @@ internal class DockGlassClient(private val changed: () -> Unit) {
 
     fun close() {
         closed = true
-        if (workerDelegate.isInitialized()) worker.post { worker.looper.quitSafely() }
+        if (workerDelegate.isInitialized()) worker.post {
+            worker.removeCallbacks(diagnosticFlush)
+            flushDiagnostics()
+            worker.looper.quitSafely()
+        }
     }
 
     private fun dispose(ticket: Ticket) {
@@ -176,15 +190,26 @@ internal class DockGlassClient(private val changed: () -> Unit) {
         ticket.surface = null
         ticket.death?.let { runCatching { ticket.lifetime?.unlinkToDeath(it, 0) } }
         ticket.death = null
+        ticket.lifetime = null
         runCatching { ticket.parcel?.release() }
         ticket.parcel = null
-        runCatching { request(ticket, "dock_glass_release") }
+        // Do not reacquire/start a renderer merely to release a failed acquisition.
+        try {
+            if (ticket.client != null) runCatching { request(ticket, "dock_glass_release") }
+        } finally {
+            runCatching { ticket.client?.close() }
+            ticket.client = null
+        }
     }
 
     private fun request(ticket: Ticket, method: String, args: Bundle? = null): Bundle {
-        // An unstable client avoids making system_server depend on the app process surviving.
-        val client = ticket.context.contentResolver.acquireUnstableContentProviderClient(uri)
-            ?: error("HyperCeiler provider unavailable")
-        client.use { return it.call(method, ticket.id, args) ?: Bundle.EMPTY }
+        // Keep an UNSTABLE reference for the lifetime of the active windowless host,
+        // instead of acquiring/releasing its process around every readiness check.
+        // Renderer death still never makes system_server a stable provider dependent.
+        val client = ticket.client ?: ticket.context.contentResolver.acquireUnstableContentProviderClient(uri)
+            ?.also { ticket.client = it } ?: error("HyperCeiler provider unavailable")
+        // All callers recover/dispose on failure. Let dispose try releasing an
+        // existing live host before closing the reference, even after a failed call.
+        return client.call(method, ticket.id, args) ?: Bundle.EMPTY
     }
 }

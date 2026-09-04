@@ -18,9 +18,14 @@
 */
 package com.sevtinge.hyperceiler.libhook.rules.home.dock
 
+import android.app.Activity
+import android.content.res.Configuration
 import android.graphics.Point
+import android.graphics.drawable.GradientDrawable
+import android.os.Bundle
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.widget.FrameLayout
 import androidx.core.view.doOnAttach
 import androidx.core.view.doOnDetach
@@ -32,22 +37,30 @@ import com.sevtinge.hyperceiler.libhook.utils.api.DisplayUtils.dp2px
 import com.sevtinge.hyperceiler.libhook.utils.hookapi.blur.MiBlurUtilsKt.addMiBackgroundBlendColor
 import com.sevtinge.hyperceiler.libhook.utils.hookapi.blur.MiBlurUtilsKt.clearAllBlur
 import com.sevtinge.hyperceiler.libhook.utils.hookapi.blur.MiBlurUtilsKt.clearMiBackgroundBlendColor
+import com.sevtinge.hyperceiler.libhook.utils.hookapi.blur.MiBlurUtilsKt.setBackgroundBlurScaleRatio
 import com.sevtinge.hyperceiler.libhook.utils.hookapi.blur.MiBlurUtilsKt.setBlurRoundRect
+import com.sevtinge.hyperceiler.libhook.utils.hookapi.blur.MiBlurUtilsKt.setMiBackgroundBlurMode
+import com.sevtinge.hyperceiler.libhook.utils.hookapi.blur.MiBlurUtilsKt.setMiBackgroundBlurRadius
 import com.sevtinge.hyperceiler.libhook.utils.hookapi.blur.MiBlurUtilsKt.setMiBackgroundBlendColors
 import com.sevtinge.hyperceiler.libhook.utils.hookapi.blur.MiBlurUtilsKt.setMiViewBlurMode
+import com.sevtinge.hyperceiler.libhook.utils.hookapi.blur.MiBlurUtilsKt.setPassWindowBlurEnabled
 import com.sevtinge.hyperceiler.libhook.utils.hookapi.tool.AppsTool
 import io.github.lingqiqi5211.ezhooktool.core.callStaticMethod
+import io.github.lingqiqi5211.ezhooktool.core.findAllMethods
 import io.github.lingqiqi5211.ezhooktool.core.findMethod
 import io.github.lingqiqi5211.ezhooktool.core.loadClass
 import io.github.lingqiqi5211.ezhooktool.core.loadClassOrNull
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.createAfterHook
+import io.github.lingqiqi5211.ezhooktool.xposed.dsl.createAfterHooks
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.getObjectFieldAs
 import org.luckypray.dexkit.query.enums.StringMatchType
 import java.lang.reflect.Method
 import java.util.function.Consumer
 
 object DockCustomNew : BaseHook() {
-    override fun useDexKit() = true
+    private const val HYPER_OS_4_LAUNCHER = "com.miui.home.launcher.Launcher"
+
+    override fun useDexKit() = !isMoreHyperOSVersion(4f)
 
     override fun initDexKit(): Boolean {
         showAnimationLambda
@@ -64,7 +77,7 @@ object DockCustomNew : BaseHook() {
     }
 
     private val folderBlurUtilsClass by lazy {
-        findClass("com.miui.home.common.utils.MiuixMaterialBlurUtilities")
+        loadClassOrNull("com.miui.home.common.utils.MiuixMaterialBlurUtilities")
     }
 
 
@@ -88,9 +101,15 @@ object DockCustomNew : BaseHook() {
     }
 
     private var isSupportHyperMaterialBlur = false
+    private var hyperOS4DockBackground: View? = null
 
     @Suppress("UNCHECKED_CAST")
     override fun init() {
+        if (isMoreHyperOSVersion(4f)) {
+            initHyperOS4()
+            return
+        }
+
         val dockBgStyle = PrefsBridge.getStringAsInt("home_dock_add_blur", 0)
         var dockBlurView: View? = null
 
@@ -105,7 +124,7 @@ object DockCustomNew : BaseHook() {
             val dockBottomMargin = dp2px(PrefsBridge.getInt("home_dock_bg_margin_bottom", 30) - 92)
 
             isSupportHyperMaterialBlur = if (isMoreHyperOSVersion(3f)) {
-                folderBlurUtilsClass.callStaticMethod("isSupportHyperMaterialBlur") as Boolean
+                folderBlurUtilsClass?.callStaticMethod("isSupportHyperMaterialBlur") as? Boolean ?: false
             } else {
                 false
             }
@@ -151,7 +170,7 @@ object DockCustomNew : BaseHook() {
             }.createAfterHook {
 
                 isSupportHyperMaterialBlur = if (isMoreHyperOSVersion(3f)) {
-                    folderBlurUtilsClass.callStaticMethod("isSupportHyperMaterialBlur") as Boolean
+                    folderBlurUtilsClass?.callStaticMethod("isSupportHyperMaterialBlur") as? Boolean ?: false
                 } else {
                     false
                 }
@@ -178,13 +197,90 @@ object DockCustomNew : BaseHook() {
         } ?: XposedLog.d(TAG, lpparam.packageName, $$"can't find lambda$showUserPresentAnimation")
     }
 
-    private fun View.addBlur() {
-        val isDarkMode by lazy {
-            if (AppsTool.isDarkMode(context) && PrefsBridge.getStringAsInt("home_other_home_mode", 0) == 0) {
-                AppsTool.isDarkMode(context)
-            } else {
-                PrefsBridge.getStringAsInt("home_other_home_mode", 0) == 2
+    /**
+     * HyperOS 4's launcher no longer contains dex bytecode. The launcher content is rendered by
+     * libapp.so/libapp_launcher.so and its Dock is presented in a separate native overlay window.
+     * Put the custom background in the Launcher activity window so that it stays below that Dock
+     * overlay while remaining above the wallpaper.
+     */
+    private fun initHyperOS4() {
+        registerHotReloadCleanup {
+            hyperOS4DockBackground?.let { view ->
+                view.post {
+                    (view.parent as? ViewGroup)?.removeView(view)
+                }
             }
+            hyperOS4DockBackground = null
+        }
+
+        Activity::class.java.findAllMethods {
+            filter {
+                (name == "onCreate" && parameterCount == 1 && parameterTypes[0] == Bundle::class.java) ||
+                    (name == "onPostResume" && parameterCount == 0) ||
+                    (name == "onConfigurationChanged" &&
+                        parameterCount == 1 && parameterTypes[0] == Configuration::class.java)
+            }
+        }.createAfterHooks { param ->
+            val activity = param.thisObject as Activity
+            if (activity.componentName.className != HYPER_OS_4_LAUNCHER) return@createAfterHooks
+
+            activity.window.decorView.post {
+                addHyperOS4DockBackground(activity)
+            }
+        }
+    }
+
+    private fun addHyperOS4DockBackground(activity: Activity) {
+        val decorView = activity.window.decorView as? ViewGroup ?: return
+        val oldView = decorView.findViewWithTag<View>(TAG)
+        if (oldView != null) {
+            (oldView.parent as? ViewGroup)?.removeView(oldView)
+        }
+
+        val dockBgStyle = PrefsBridge.getStringAsInt("home_dock_add_blur", 0)
+        val dockBgColor = PrefsBridge.getInt("home_dock_bg_color", 0)
+        val dockRadius = dp2px(PrefsBridge.getInt("home_dock_bg_radius", 30))
+        val dockHeight = dp2px(PrefsBridge.getInt("home_dock_bg_height", 150))
+        val dockMargin = dp2px(PrefsBridge.getInt("home_dock_bg_margin_horizontal", 25))
+        val dockBottomMargin = dp2px(PrefsBridge.getInt("home_dock_bg_margin_bottom", 15))
+
+        // HyperOS 4 exposes its real glass renderer only inside the Flutter engine. For an
+        // Android overlay, combine the compositor pass blur with the same material blend modes
+        // and a specular gradient. Unsupported devices fall back to a translucent surface.
+        isSupportHyperMaterialBlur = true
+
+        val dockBackground = View(activity).apply {
+            tag = TAG
+            isClickable = false
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+
+            when (dockBgStyle) {
+                0 -> setBackgroundColor(dockBgColor)
+                1 -> {
+                    doOnAttach { addBlur() }
+                    doOnDetach { clearAllBlur() }
+                }
+            }
+            setBlurRoundRect(dockRadius)
+        }
+        hyperOS4DockBackground = dockBackground
+
+        decorView.addView(
+            dockBackground,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, dockHeight).apply {
+                gravity = Gravity.BOTTOM
+                setMargins(dockMargin, 0, dockMargin, dockBottomMargin)
+            }
+        )
+    }
+
+    private fun View.addBlur() {
+        val isDarkMode = isDarkDockMode()
+
+        if (isMoreHyperOSVersion(4f)) {
+            addHyperOS4SoftGlass(isDarkMode)
+            return
         }
 
         clearMiBackgroundBlendColor()
@@ -214,5 +310,54 @@ object DockCustomNew : BaseHook() {
             }
         }
     }
-}
 
+    private fun View.addHyperOS4SoftGlass(isDarkMode: Boolean) {
+        runCatching {
+            clearAllBlur()
+            setPassWindowBlurEnabled(true)
+            setMiBackgroundBlurMode(1)
+            setMiBackgroundBlurRadius(120)
+            // Some OS4 builds omit the scale-ratio extension while retaining pass blur.
+            runCatching { setBackgroundBlurScaleRatio(0.82f) }
+            setMiViewBlurMode(3)
+
+            val materialColors = ArrayList<Point>()
+            if (isDarkMode) {
+                materialColors.add(Point(0x66767676, 19))
+                materialColors.add(Point(0x33141414, 15))
+                materialColors.add(Point(0x14000000, 3))
+            } else {
+                materialColors.add(Point(0x66FFFFFF, 19))
+                materialColors.add(Point(0x26E9E9E9, 15))
+                materialColors.add(Point(0x0FFFFFFF, 3))
+            }
+            setMiBackgroundBlendColors(materialColors)
+            background = createSoftGlassHighlight(isDarkMode)
+        }.onFailure {
+            XposedLog.w(TAG, lpparam.packageName, "Soft glass is unavailable; using translucent fallback", it)
+            runCatching { clearAllBlur() }
+            background = createSoftGlassHighlight(isDarkMode)
+        }
+    }
+
+    private fun createSoftGlassHighlight(isDarkMode: Boolean): GradientDrawable {
+        val colors = if (isDarkMode) {
+            intArrayOf(0x367A7A7A, 0x22505050, 0x18202020)
+        } else {
+            intArrayOf(0x66FFFFFF, 0x36FFFFFF, 0x1AFFFFFF)
+        }
+        val strokeColor = if (isDarkMode) 0x33FFFFFF else 0x80FFFFFF.toInt()
+        return GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, colors).apply {
+            cornerRadius = dp2px(PrefsBridge.getInt("home_dock_bg_radius", 30)).toFloat()
+            setStroke(dp2px(1), strokeColor)
+        }
+    }
+
+    private fun View.isDarkDockMode(): Boolean {
+        return when (PrefsBridge.getStringAsInt("home_other_home_mode", 0)) {
+            1 -> false
+            2 -> true
+            else -> AppsTool.isDarkMode(context)
+        }
+    }
+}

@@ -71,6 +71,18 @@ android {
             // noinspection ChromeOsAbiSupport
             abiFilters += "arm64-v8a"
         }
+
+        externalNativeBuild {
+            cmake {
+                cppFlags += listOf("-std=c++20", "-fvisibility=hidden")
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+        }
     }
 
     buildFeatures {
@@ -86,6 +98,9 @@ android {
         resources {
             merges += listOf("META-INF/xposed/*")
             excludes += listOf("**")
+        }
+        jniLibs {
+            useLegacyPackaging = false
         }
         dex {
             useLegacyPackaging = true

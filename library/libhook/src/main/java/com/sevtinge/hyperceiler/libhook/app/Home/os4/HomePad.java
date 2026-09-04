@@ -13,7 +13,6 @@ import com.hchen.database.HookBase;
 import com.sevtinge.hyperceiler.common.utils.PrefsBridge;
 import com.sevtinge.hyperceiler.libhook.base.BaseLoad;
 import com.sevtinge.hyperceiler.libhook.rules.home.HomePortraitReverse;
-import com.sevtinge.hyperceiler.libhook.rules.home.dock.DockCustomNew;
 import com.sevtinge.hyperceiler.libhook.rules.home.gesture.HomeGestureOS4;
 import com.sevtinge.hyperceiler.libhook.rules.home.gesture.ShakeDevice;
 import com.sevtinge.hyperceiler.libhook.rules.home.os4.HomeSettingsOS4;
@@ -32,7 +31,7 @@ public class HomePad extends BaseLoad {
             || PrefsBridge.getInt("home_gesture_up_swipe2_action", 0) > 0
             || PrefsBridge.getInt("home_gesture_down_swipe2_action", 0) > 0;
 
-        initHook(DockCustomNew.INSTANCE, PrefsBridge.getBoolean("home_dock_bg_custom_enable"));
+        // OS4 dock background is installed by SystemFrameworkB (HomeDockWindow).
         initHook(HomeGestureOS4.INSTANCE, gesturesEnabled && hasTouchGesture);
         initHook(new ShakeDevice(), gesturesEnabled
             && PrefsBridge.getInt("home_gesture_shake_action", 0) > 0);

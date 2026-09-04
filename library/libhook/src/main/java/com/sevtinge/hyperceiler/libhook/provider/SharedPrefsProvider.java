@@ -28,6 +28,7 @@ import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
 import android.os.ParcelFileDescriptor;
+import android.os.Bundle;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -47,6 +48,15 @@ public class SharedPrefsProvider extends ContentProvider {
     private static final UriMatcher uriMatcher = new UriMatcher(UriMatcher.NO_MATCH);
 
     SharedPreferences prefs;
+    private final DockGlassHost dockGlassHost = new DockGlassHost();
+
+    @Override
+    public Bundle call(String method, String arg, Bundle extras) {
+        if (method != null && method.startsWith("dock_glass_")) {
+            return dockGlassHost.call(getContext(), method, arg, extras);
+        }
+        return super.call(method, arg, extras);
+    }
 
     static {
         uriMatcher.addURI(AUTHORITY, "string/*", 0);
@@ -77,6 +87,9 @@ public class SharedPrefsProvider extends ContentProvider {
 
     @Override
     public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder) {
+        if (AUTHORITY.equals(uri.getAuthority()) && "/diagnostics/dock_glass_api".equals(uri.getPath())) {
+            return DockGlassDiagnostics.query();
+        }
         if (prefs == null) {
             return new MatrixCursor(new String[]{"data"});
         }

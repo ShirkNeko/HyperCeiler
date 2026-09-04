@@ -75,8 +75,6 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags += listOf("-std=c++20", "-fvisibility=hidden")
-                arguments += "-DHYPERCEILER_DOCK_NATIVE_PROBE=" +
-                    if (providers.gradleProperty("dockNativeProbe").orNull == "true") "ON" else "OFF"
             }
         }
     }

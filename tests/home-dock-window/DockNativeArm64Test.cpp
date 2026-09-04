@@ -20,7 +20,7 @@ alignas(8) std::atomic<uint64_t> dock_motion_value{0x3ff0000000000000ULL};
 alignas(4) std::atomic<uint32_t> dock_motion_subscribed{0};
 int dock_motion_event = -1;
 extern const uint64_t dock_motion_one = 1;
-void *dock_probe_original = reinterpret_cast<void *>(dock_test_trampoline);
+void *dock_motion_scale_original = reinterpret_cast<void *>(dock_test_trampoline);
 void *dock_motion_anim_original = reinterpret_cast<void *>(dock_test_trampoline);
 void *dock_motion_set_original = reinterpret_cast<void *>(dock_test_trampoline);
 }

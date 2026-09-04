@@ -13,8 +13,8 @@
 #include <cstring>
 #include <string_view>
 
-#ifdef HYPERCEILER_DOCK_NATIVE_OBSERVER
-void start_dock_native_probe(int (*hook)(void *, void *, void **));
+#ifdef HYPERCEILER_DOCK_NATIVE_MOTION
+void start_dock_native_motion(int (*hook)(void *, void *, void **));
 #endif
 
 namespace {
@@ -129,8 +129,8 @@ NativeOnModuleLoaded native_init(const NativeApiEntries *entries) {
     // Install before libapp_launcher/libapp run their static initialization and cache the
     // properties. The load callback remains as a retry path for unusual linker ordering.
     install_property_hook();
-#ifdef HYPERCEILER_DOCK_NATIVE_OBSERVER
-    start_dock_native_probe(g_hook_function);
+#ifdef HYPERCEILER_DOCK_NATIVE_MOTION
+    start_dock_native_motion(g_hook_function);
 #endif
     return on_library_loaded;
 }

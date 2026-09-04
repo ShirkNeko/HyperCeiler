@@ -1,5 +1,13 @@
 # HyperOS 4 Dock window regression checks
 
+Current code retains native motion, strict 6236 guards and wallpaper fallback.
+The temporary three-minute probe, its Gradle flag, assembly and 6179 diagnostic
+profile have been removed. Probe-related sections below are historical results,
+not current build instructions. The active native files are `dock_native_hooks.cpp`,
+`dock_native_motion.cpp`, `dock_native_motion_arm64.S` and `dock_native_motion_profile.h`.
+`DockNativeMotionProfileTest.cpp` now verifies 6236 and rejects the 6179 artifact;
+6179 continues to use the existing scene fallback, as before this cleanup.
+
 The September 4 device log shows `Loaded HyperOS Runtime native module` for
 HyperCeiler, but no launcher Java hook entry. An `Activity.onCreate` hook cannot
 create the Dock view in this dex-free launcher. `HomeDockWindow` instead runs in
@@ -26,16 +34,28 @@ javac -d "$dock_test_dir" \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockRecentsMotion.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassRetryPolicy.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockWallpaperEndpoint.java \
+  library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockNativeMotion.java \
   tests/home-dock-window/DockWindowPolicyTest.java \
   tests/home-dock-window/DockGlassPresetTest.java \
   tests/home-dock-window/DockRecentsMotionTest.java \
   tests/home-dock-window/DockGlassRetryPolicyTest.java \
-  tests/home-dock-window/DockWallpaperEndpointTest.java
+  tests/home-dock-window/DockWallpaperEndpointTest.java \
+  tests/home-dock-window/DockNativeMotionTest.java
 java -cp "$dock_test_dir" DockWindowPolicyTest
 java -cp "$dock_test_dir" DockGlassPresetTest
 java -cp "$dock_test_dir" DockRecentsMotionTest
 java -cp "$dock_test_dir" DockGlassRetryPolicyTest
 java -cp "$dock_test_dir" DockWallpaperEndpointTest
+java -cp "$dock_test_dir" DockNativeMotionTest
+```
+
+Native profile checks (optional arguments are local 6236 and/or 6179 libapp.so
+artifacts; APKs are not committed):
+
+```sh
+clang++ -std=c++20 -Wall -Wextra -Werror \
+  tests/home-dock-window/DockNativeMotionProfileTest.cpp -o "$dock_test_dir/profile-test"
+"$dock_test_dir/profile-test"
 ```
 
 ## Required device verification (not covered by host tests)

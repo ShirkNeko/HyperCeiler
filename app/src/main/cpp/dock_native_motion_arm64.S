@@ -45,7 +45,6 @@ dock_motion_scale_entry:
     cmp w16, #62
     b.ne .Lscale_done
     ldur x10, [x2, #7]
-    and x10, x10, #-4
     adrp x17, dock_motion_value
     add x17, x17, :lo12:dock_motion_value
 .Lscale_retry:
@@ -61,8 +60,8 @@ dock_motion_scale_entry:
 .Lscale_done:
     clrex
     restore_state
-    adrp x16, dock_probe_original
-    ldr x16, [x16, :lo12:dock_probe_original]
+    adrp x16, dock_motion_scale_original
+    ldr x16, [x16, :lo12:dock_motion_scale_original]
     br x16
 .size dock_motion_scale_entry, .-dock_motion_scale_entry
 

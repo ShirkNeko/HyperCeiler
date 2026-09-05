@@ -26,6 +26,7 @@ using UnhookFunction = int (*)(void *function);
 using NativeOnModuleLoaded = void (*)(const char *name, void *handle);
 
 struct NativeApiEntries {
+    // Loader-owned ABI: unused optional entries still occupy their original slots.
     uint32_t version;
     HookFunction hook_func;
     UnhookFunction unhook_func;
@@ -125,6 +126,7 @@ Java_com_sevtinge_hyperceiler_libhook_rules_home_os4_NativeHomeHooks_nativeConfi
 extern "C" [[gnu::visibility("default")]] [[gnu::used]]
 NativeOnModuleLoaded native_init(const NativeApiEntries *entries) {
     if (entries == nullptr || entries->hook_func == nullptr) return nullptr;
+    __android_log_print(ANDROID_LOG_INFO, kLogTag, "native hook API version=%u", entries->version);
     g_hook_function = entries->hook_func;
     // Install before libapp_launcher/libapp run their static initialization and cache the
     // properties. The load callback remains as a retry path for unusual linker ordering.

@@ -1,9 +1,17 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
-// Pinned 6236 Dart ABI, not AAPCS: x15 stack, x16/x17 scratch.
+// Dart compressed-pointer ARM64 ABI, not AAPCS: x15 stack, x16/x17 scratch.
+// Tagged header (-1), CID bits and bool singleton offsets are Dart ABI constants.
+// Launcher addresses, class IDs and payload field offsets are resolved at runtime.
 // No heap writes, retained pointers, C calls, FP changes or runtime safepoints.
 // Notification uses only a raw nonblocking write(2) to our permanent eventfd.
+#include "dock_native_layout.h"
 .text
 .p2align 4
+.macro layout reg, field
+    adrp x\reg, dock_motion_layout
+    add x\reg, x\reg, :lo12:dock_motion_layout
+    ldr w\reg, [x\reg, #\field]
+.endm
 .macro save_state
     stp x9, x10, [x15, #-16]!
     mrs x9, nzcv
@@ -42,9 +50,12 @@ dock_motion_scale_entry:
     tbz x2, #0, .Lscale_done
     ldur w16, [x2, #-1]
     ubfx w16, w16, #12, #20
-    cmp w16, #62
+    layout 9, DOCK_DOUBLE_CID
+    cmp w16, w9
     b.ne .Lscale_done
-    ldur x10, [x2, #7]
+    layout 16, DOCK_DOUBLE_VALUE_OFFSET
+    ldr x10, [x2, x16]
+    and x10, x10, #-4
     adrp x17, dock_motion_value
     add x17, x17, :lo12:dock_motion_value
 .Lscale_retry:
@@ -71,29 +82,34 @@ dock_motion_scale_entry:
 .type \name, %function
 \name:
     save_state
-    // aPb = ShortcutMenuLayerParams, verified CID/size/layout for 6236.
+    // ShortcutMenuLayerParams: CID/size/layout corroborated by runtime code.
     mov x10, #0
     tbz x2, #0, 90f
     ldur w16, [x2, #-1]
     ubfx w16, w16, #12, #20
-    cmp w16, #1777
+    layout 9, DOCK_PARAMS_CID
+    cmp w16, w9
     b.ne 90f
     // Only opaque icon-layer scenes qualify; folder/app fades do not.
     mov x11, #0x3ff0000000000000
-    ldur x16, [x2, #7]
+    layout 16, DOCK_ALPHA_OFFSET
+    ldr x16, [x2, x16]
     cmp x16, x11
     b.ne 90f
-    ldur w16, [x2, #0x2f]
+    layout 16, DOCK_SURFACE_OFFSET
+    ldr w16, [x2, x16]
     add x17, x22, #0x30
     cmp w16, w17
     b.ne 90f
-    ldur w16, [x2, #0x33]
+    layout 16, DOCK_RECENTS_OFFSET
+    ldr w16, [x2, x16]
     add x17, x22, #0x20
     cmp w16, w17
     b.ne 80f
     // Recents targets are at/near .95; exclude folder/app zooms even if their
     // params inherit the default shouldTryDisableByRecents=true flag.
-    ldur x16, [x2, #0xf]
+    layout 16, DOCK_SCALE_OFFSET
+    ldr x16, [x2, x16]
     cmp x16, x11
     b.eq 80f
     b.hi 90f
@@ -107,7 +123,8 @@ dock_motion_scale_entry:
     b 90f
 80:
     // Home return is permitted only by the receiver's existing recents latch.
-    ldur x16, [x2, #0xf]
+    layout 16, DOCK_SCALE_OFFSET
+    ldr x16, [x2, x16]
     cmp x16, x11
     b.ne 90f
     mov x10, #2
@@ -129,9 +146,11 @@ dock_motion_scale_entry:
     tbz x2, #0, 91f
     ldur w16, [x2, #-1]
     ubfx w16, w16, #12, #20
-    cmp w16, #1777
+    layout 9, DOCK_PARAMS_CID
+    cmp w16, w9
     b.ne 91f
-    ldur x11, [x2, #0xf]
+    layout 16, DOCK_SCALE_OFFSET
+    ldr x11, [x2, x16]
 91:
     and x11, x11, #-4
     orr x10, x10, x11

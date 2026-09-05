@@ -2,8 +2,12 @@
 package com.sevtinge.hyperceiler.libhook.provider;
 
 import android.database.MatrixCursor;
+import android.graphics.RenderEffect;
+import android.graphics.RenderNode;
 import android.os.Binder;
 import android.os.Process;
+import android.view.SurfaceControl;
+import android.view.View;
 
 import org.lsposed.hiddenapibypass.HiddenApiBypass;
 
@@ -21,6 +25,20 @@ final class DockGlassDiagnostics {
             throw new SecurityException("Dock diagnostics are restricted to this app and ADB");
         }
         MatrixCursor cursor = new MatrixCursor(new String[]{"api"});
+        addCapabilities(cursor);
+        for (Class<?> type : new Class<?>[]{SurfaceControl.Transaction.class, SurfaceControl.Builder.class,
+                View.class, RenderEffect.class, RenderNode.class}) {
+            addMethods(cursor, type);
+        }
+        try {
+            addMethods(cursor, Class.forName("com.android.internal.graphics.drawable.BackgroundBlurDrawable"));
+        } catch (ClassNotFoundException error) {
+            cursor.addRow(new Object[]{"BackgroundBlurDrawable: unavailable"});
+        }
+        return cursor;
+    }
+
+    private static void addCapabilities(MatrixCursor cursor) {
         try {
             Class<?> root = Class.forName("android.view.ViewRootImpl");
             for (String capability : new String[]{"getSupportedBionicMaterial", "getSupportedMiBlur"}) {
@@ -29,30 +47,27 @@ final class DockGlassDiagnostics {
         } catch (Throwable error) {
             cursor.addRow(new Object[]{"Capability query: " + error.getClass().getSimpleName()});
         }
-        String[] names = {
-            "android.view.SurfaceControl$Transaction", "android.view.SurfaceControl$Builder",
-            "android.view.View", "android.graphics.RenderEffect", "android.graphics.RenderNode",
-            "com.android.internal.graphics.drawable.BackgroundBlurDrawable"
-        };
-        for (String name : names) {
-            try {
-                Class<?> type = Class.forName(name);
-                TreeSet<String> matches = new TreeSet<>();
-                for (Executable method : HiddenApiBypass.getDeclaredMethods(type)) {
-                    String lower = method.getName().toLowerCase(Locale.ROOT);
-                    if (lower.contains("glass") || lower.contains("blur") || lower.contains("material")
-                            || lower.contains("backdrop") || lower.contains("stroke")
-                            || lower.contains("refract") || lower.contains("blend")
-                            || lower.contains("shader") || lower.contains("effect")) {
-                        matches.add(method.toString());
-                    }
-                }
-                if (matches.isEmpty()) matches.add(name + ": no matching API");
-                for (String match : matches) cursor.addRow(new Object[]{match});
-            } catch (Throwable error) {
-                cursor.addRow(new Object[]{name + ": " + error.getClass().getSimpleName()});
-            }
+    }
+
+    private static boolean isMaterialMethod(Executable method) {
+        String lower = method.getName().toLowerCase(Locale.ROOT);
+        for (String word : new String[]{"glass", "blur", "material", "backdrop", "stroke",
+                "refract", "blend", "shader", "effect"}) {
+            if (lower.contains(word)) return true;
         }
-        return cursor;
+        return false;
+    }
+
+    private static void addMethods(MatrixCursor cursor, Class<?> type) {
+        try {
+            TreeSet<String> matches = new TreeSet<>();
+            for (Executable method : HiddenApiBypass.getDeclaredMethods(type)) {
+                if (isMaterialMethod(method)) matches.add(method.toString());
+            }
+            if (matches.isEmpty()) matches.add(type.getName() + ": no matching API");
+            for (String match : matches) cursor.addRow(new Object[]{match});
+        } catch (Throwable error) {
+            cursor.addRow(new Object[]{type.getName() + ": " + error.getClass().getSimpleName()});
+        }
     }
 }

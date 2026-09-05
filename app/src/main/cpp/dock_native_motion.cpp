@@ -20,6 +20,7 @@ alignas(8) std::atomic<uint64_t> dock_motion_value{0x3ff0000000000000ULL};
 alignas(4) std::atomic<uint32_t> dock_motion_subscribed{0};
 int dock_motion_event = -1;
 extern const uint64_t dock_motion_one = 1;
+void *dock_motion_scale_original = nullptr;
 void *dock_motion_anim_original = nullptr;
 void *dock_motion_set_original = nullptr;
 }
@@ -68,7 +69,7 @@ void run_dock_motion() {
         close(server);
         return;
     }
-    __android_log_print(ANDROID_LOG_INFO, kTag, "motion v7 ready: launcher=6236; event-driven native scale");
+    __android_log_print(ANDROID_LOG_INFO, kTag, "motion v8 ready: dynamically resolved; event-driven native scale");
     int client = -1;
     uint64_t sequence = 0;
     unsigned connections = 0;
@@ -106,9 +107,9 @@ void run_dock_motion() {
             }
         }
         if (descriptors[1].revents & POLLIN) {
-            uint64_t count;
-            const auto result = read(dock_motion_event, &count, sizeof(count));
-            if (result == sizeof(count) && client >= 0 && !send_sample(client, sequence)) disconnect();
+            eventfd_t count = 0;
+            if (eventfd_read(dock_motion_event, &count) == 0 && client >= 0
+                && !send_sample(client, sequence)) disconnect();
         }
     }
     disconnect();

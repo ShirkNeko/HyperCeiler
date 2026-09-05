@@ -32,6 +32,17 @@ internal class DockGlassClient(private val changed: () -> Unit) {
         var attempts = 0
         var recoveryPending = false
         var client: ContentProviderClient? = null
+
+        fun request(method: String, args: Bundle? = null): Bundle {
+            // Keep an UNSTABLE reference for the lifetime of the active windowless host,
+            // instead of acquiring/releasing its process around every readiness check.
+            // Renderer death still never makes system_server a stable provider dependent.
+            val activeClient = client ?: context.contentResolver.acquireUnstableContentProviderClient(uri)
+                ?.also { client = it } ?: error("HyperCeiler provider unavailable")
+            // All callers recover/dispose on failure. Let dispose try releasing an
+            // existing live host before closing the reference, even after a failed call.
+            return activeClient.call(method, id, args) ?: Bundle.EMPTY
+        }
     }
 
     private val owner = Binder()
@@ -39,52 +50,65 @@ internal class DockGlassClient(private val changed: () -> Unit) {
         Handler(HandlerThread("HyperCeiler-DockGlass-IPC").apply { start() }.looper)
     }
     private val worker by workerDelegate
-    private val uri = Uri.parse("content://com.sevtinge.hyperceiler.provider.sharedprefs")
+    private companion object {
+        val uri: Uri = Uri.parse("content://com.sevtinge.hyperceiler.provider.sharedprefs")
+    }
     @Volatile private var closed = false
-    @Volatile private var diagnosticContext: Context? = null
-    private val events = ArrayDeque<String>() // IPC worker only; no frame-by-frame history.
-    private var diagnosticFlushScheduled = false
-    private val diagnosticFlush = Runnable {
-        diagnosticFlushScheduled = false
-        flushDiagnostics()
-    }
+    private val journal = Journal { worker }
 
-    fun bindDiagnostics(context: Context) {
-        if (diagnosticContext != null || closed) return
-        diagnosticContext = context
-        worker.post { flushDiagnostics() }
-    }
+    private class Journal(private val worker: () -> Handler) {
+        @Volatile private var diagnosticContext: Context? = null
+        private val events = ArrayDeque<String>() // IPC worker only; no frame-by-frame history.
+        private var diagnosticFlushScheduled = false
+        private val diagnosticFlush = Runnable {
+            diagnosticFlushScheduled = false
+            flushDiagnostics()
+        }
 
-    fun record(event: String) {
-        if (closed) return
-        val message = "wall=${System.currentTimeMillis()} up=${SystemClock.uptimeMillis()} $event".take(512)
-        // Deliberately independent of the release build's error-only Xposed log filter.
-        Log.i("HyperCeiler.DockGlass", message)
-        worker.post {
-            if (events.size >= 96) events.removeFirst()
-            events.addLast(message)
-            if (!diagnosticFlushScheduled) {
-                diagnosticFlushScheduled = true
-                worker.postDelayed(diagnosticFlush, 250)
+        fun bind(context: Context) {
+            if (diagnosticContext != null) return
+            diagnosticContext = context
+            worker().post { flushDiagnostics() }
+        }
+
+        fun record(event: String) {
+            val message = "wall=${System.currentTimeMillis()} up=${SystemClock.uptimeMillis()} $event".take(512)
+            // Deliberately independent of the release build's error-only Xposed log filter.
+            Log.i("HyperCeiler.DockGlass", message)
+            worker().post {
+                if (events.size >= 96) events.removeFirst()
+                events.addLast(message)
+                if (!diagnosticFlushScheduled) {
+                    diagnosticFlushScheduled = true
+                    worker().postDelayed(diagnosticFlush, 250)
+                }
             }
+        }
+
+        private fun flushDiagnostics() {
+            val context = diagnosticContext ?: return
+            if (events.isEmpty()) return
+            runCatching {
+                val client = context.contentResolver.acquireUnstableContentProviderClient(uri)
+                    ?: return
+                client.use {
+                    it.call("dock_glass_record", null, Bundle().apply {
+                        putStringArray("events", events.toTypedArray())
+                    }) ?: error("No journal response")
+                }
+                events.clear()
+            }
+            // If boot-time provider acquisition fails, retain the bounded queue for the next event.
+        }
+
+        fun finish() {
+            worker().removeCallbacks(diagnosticFlush)
+            flushDiagnostics()
         }
     }
 
-    private fun flushDiagnostics() {
-        val context = diagnosticContext ?: return
-        if (events.isEmpty()) return
-        runCatching {
-            val client = context.contentResolver.acquireUnstableContentProviderClient(uri)
-                ?: return
-            client.use {
-                it.call("dock_glass_record", null, Bundle().apply {
-                    putStringArray("events", events.toTypedArray())
-                }) ?: error("No journal response")
-            }
-            events.clear()
-        }
-        // If boot-time provider acquisition fails, retain the bounded queue for the next event.
-    }
+    fun bindDiagnostics(context: Context) { if (!closed) journal.bind(context) }
+    fun record(event: String) { if (!closed) journal.record(event) }
 
     fun create(context: Context, key: String, bounds: DockWindowPolicy.Bounds, dark: Boolean): Ticket {
         val ticket = Ticket(key, context, bounds, dark)
@@ -106,7 +130,7 @@ internal class DockGlassClient(private val changed: () -> Unit) {
                 putFloat("radius", bounds.radius()); putBoolean("dark", ticket.dark)
                 putBinder("owner", owner)
             }
-            val response = request(ticket, "dock_glass_create", args)
+            val response = ticket.request("dock_glass_create", args)
             response.classLoader = SurfaceControlViewHost.SurfacePackage::class.java.classLoader
             ticket.parcel = response.getParcelable("surface", SurfaceControlViewHost.SurfacePackage::class.java)
                 ?: error(response.getString("error") ?: "Renderer returned no surface")
@@ -131,10 +155,11 @@ internal class DockGlassClient(private val changed: () -> Unit) {
     }
 
     private fun checkBackground(ticket: Ticket, attempt: Int, generation: Int) {
-        worker.postDelayed({
-            if (ticket.cancelled || ticket.dead || closed || generation != ticket.attempts) return@postDelayed
+        worker.postDelayed(fun() {
+            if (ticket.cancelled || ticket.dead || closed) return
+            if (generation != ticket.attempts) return
             try {
-                val status = request(ticket, "dock_glass_status")
+                val status = ticket.request("dock_glass_status")
                 status.getString("error")?.let { error(it) }
                 ticket.ready = status.getBoolean("backgroundReady")
                 if (ticket.ready) {
@@ -179,8 +204,7 @@ internal class DockGlassClient(private val changed: () -> Unit) {
     fun close() {
         closed = true
         if (workerDelegate.isInitialized()) worker.post {
-            worker.removeCallbacks(diagnosticFlush)
-            flushDiagnostics()
+            journal.finish()
             worker.looper.quitSafely()
         }
     }
@@ -195,21 +219,11 @@ internal class DockGlassClient(private val changed: () -> Unit) {
         ticket.parcel = null
         // Do not reacquire/start a renderer merely to release a failed acquisition.
         try {
-            if (ticket.client != null) runCatching { request(ticket, "dock_glass_release") }
+            if (ticket.client != null) runCatching { ticket.request("dock_glass_release") }
         } finally {
             runCatching { ticket.client?.close() }
             ticket.client = null
         }
     }
 
-    private fun request(ticket: Ticket, method: String, args: Bundle? = null): Bundle {
-        // Keep an UNSTABLE reference for the lifetime of the active windowless host,
-        // instead of acquiring/releasing its process around every readiness check.
-        // Renderer death still never makes system_server a stable provider dependent.
-        val client = ticket.client ?: ticket.context.contentResolver.acquireUnstableContentProviderClient(uri)
-            ?.also { ticket.client = it } ?: error("HyperCeiler provider unavailable")
-        // All callers recover/dispose on failure. Let dispose try releasing an
-        // existing live host before closing the reference, even after a failed call.
-        return client.call(method, ticket.id, args) ?: Bundle.EMPTY
-    }
 }

@@ -7,7 +7,7 @@
  *
  * Copyright (C) 2023-2026 HyperCeiler Contributions
  */
-package com.sevtinge.hyperceiler.libhook.app.Home.os4;
+package com.sevtinge.hyperceiler.libhook.app.os4.home;
 
 import com.hchen.database.HookBase;
 import com.sevtinge.hyperceiler.common.utils.PrefsBridge;

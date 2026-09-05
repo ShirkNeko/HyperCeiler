@@ -1,12 +1,8 @@
 # HyperOS 4 Dock window regression checks
 
-Current code retains native motion, strict 6236 guards and wallpaper fallback.
-The temporary three-minute probe, its Gradle flag, assembly and 6179 diagnostic
-profile have been removed. Probe-related sections below are historical results,
-not current build instructions. The active native files are `dock_native_hooks.cpp`,
-`dock_native_motion.cpp`, `dock_native_motion_arm64.S` and `dock_native_motion_profile.h`.
-`DockNativeMotionProfileTest.cpp` now verifies 6236 and rejects the 6179 artifact;
-6179 continues to use the existing scene fallback, as before this cleanup.
+Current native implementation: [v8 dynamic resolution and verification](NATIVE_DYNAMIC_RESOLUTION.md).
+The probe/v7 sections below are historical investigation notes; their address
+profiles and opt-in probe have been removed and are not used by current builds.
 
 The September 4 device log shows `Loaded HyperOS Runtime native module` for
 HyperCeiler, but no launcher Java hook entry. An `Activity.onCreate` hook cannot
@@ -41,21 +37,10 @@ javac -d "$dock_test_dir" \
   tests/home-dock-window/DockGlassRetryPolicyTest.java \
   tests/home-dock-window/DockWallpaperEndpointTest.java \
   tests/home-dock-window/DockNativeMotionTest.java
-java -cp "$dock_test_dir" DockWindowPolicyTest
-java -cp "$dock_test_dir" DockGlassPresetTest
-java -cp "$dock_test_dir" DockRecentsMotionTest
-java -cp "$dock_test_dir" DockGlassRetryPolicyTest
-java -cp "$dock_test_dir" DockWallpaperEndpointTest
-java -cp "$dock_test_dir" DockNativeMotionTest
-```
 
-Native profile checks (optional arguments are local 6236 and/or 6179 libapp.so
-artifacts; APKs are not committed):
-
-```sh
-clang++ -std=c++20 -Wall -Wextra -Werror \
-  tests/home-dock-window/DockNativeMotionProfileTest.cpp -o "$dock_test_dir/profile-test"
-"$dock_test_dir/profile-test"
+for test in DockWindowPolicy DockGlassPreset DockRecentsMotion DockGlassRetryPolicy DockWallpaperEndpoint DockNativeMotion; do
+  java -cp "$dock_test_dir" "com.sevtinge.hyperceiler.tests.dock.${test}Test"
+done
 ```
 
 ## Required device verification (not covered by host tests)

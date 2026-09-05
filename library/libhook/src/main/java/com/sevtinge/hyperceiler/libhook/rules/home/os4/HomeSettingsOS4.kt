@@ -35,20 +35,22 @@ object HomeSettingsOS4 : BaseHook() {
             parameterTypes(Bundle::class.java)
         }.createBeforeHook { param ->
             val activity = param.thisObject as Activity
-            if (activity.componentName.className != LAUNCHER_ACTIVITY) return@createBeforeHook
+            if (activity.componentName.className == LAUNCHER_ACTIVITY) applyHomeMode(activity, homeMode)
+        }
+    }
 
-            val nightMode = if (homeMode == 2) {
-                Configuration.UI_MODE_NIGHT_YES
-            } else {
-                Configuration.UI_MODE_NIGHT_NO
-            }
-            runCatching {
-                activity.applyOverrideConfiguration(Configuration().apply {
-                    uiMode = nightMode
-                })
-            }.onFailure {
-                XposedLog.e(TAG, lpparam.packageName, "Unable to override launcher night mode", it)
-            }
+    private fun applyHomeMode(activity: Activity, homeMode: Int) {
+        val nightMode = if (homeMode == 2) {
+            Configuration.UI_MODE_NIGHT_YES
+        } else {
+            Configuration.UI_MODE_NIGHT_NO
+        }
+        runCatching {
+            activity.applyOverrideConfiguration(Configuration().apply {
+                uiMode = nightMode
+            })
+        }.onFailure {
+            XposedLog.e(TAG, lpparam.packageName, "Unable to override launcher night mode", it)
         }
     }
 

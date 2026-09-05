@@ -3,7 +3,7 @@ project(hyperceiler_home LANGUAGES CXX)
 
 add_library(hyperceiler_home SHARED hyperceiler_home.cpp)
 
-option(HYPERCEILER_DOCK_NATIVE_MOTION "Follow pinned OS4 native recents animation" ON)
+option(HYPERCEILER_DOCK_NATIVE_MOTION "Dynamically resolve OS4 native recents animation" ON)
 if(HYPERCEILER_DOCK_NATIVE_MOTION)
     enable_language(ASM)
     target_sources(hyperceiler_home PRIVATE dock_native_hooks.cpp dock_native_motion.cpp dock_native_motion_arm64.S)

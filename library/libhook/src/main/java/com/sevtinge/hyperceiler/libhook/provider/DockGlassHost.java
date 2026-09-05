@@ -29,7 +29,9 @@ import org.lsposed.hiddenapibypass.HiddenApiBypass;
 import java.lang.reflect.Field;
 import java.util.HashMap;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /** Own-process HWUI only. Never execute vendor RenderThread code in system_server. */
 final class DockGlassHost {
@@ -56,6 +58,16 @@ final class DockGlassHost {
     }
 
     Bundle call(Context context, String method, String id, Bundle args) {
+        checkCaller(method);
+        return switch (method) {
+            case "dock_glass_history" -> DockDiagnosticJournal.access(context, null);
+            case "dock_glass_record" -> DockDiagnosticJournal.access(context, args);
+            case "dock_glass_self_test" -> selfTest(context);
+            default -> callHost(context, method, id, args);
+        };
+    }
+
+    private static void checkCaller(String method) {
         int uid = Binder.getCallingUid();
         boolean selfTest = "dock_glass_self_test".equals(method);
         boolean diagnostics = "dock_glass_diagnostics".equals(method);
@@ -64,61 +76,65 @@ final class DockGlassHost {
                 && !((selfTest || diagnostics || history) && uid == 2000)) {
             throw new SecurityException("Only the system Dock hook may manage glass hosts");
         }
-        // Shell can read module metadata, but cannot write events or manage hosts.
-        if (history) return DockDiagnosticJournal.access(context, null);
-        if ("dock_glass_record".equals(method)) return DockDiagnosticJournal.access(context, args);
-        if (selfTest) return selfTest(context);
-        if (!diagnostics && (id == null || id.length() > 100)) throw new IllegalArgumentException("Invalid host id");
+    }
+
+    private Bundle callHost(Context context, String method, String id, Bundle args) {
+        if (!"dock_glass_diagnostics".equals(method) && (id == null || id.length() > 100)) {
+            throw new IllegalArgumentException("Invalid host id");
+        }
         CompletableFuture<Bundle> result = new CompletableFuture<>();
-        main.post(() -> {
-            if (result.isDone()) return;
-            try {
-                switch (method) {
-                    case "dock_glass_diagnostics" -> result.complete(diagnostics());
-                    case "dock_glass_create" -> create(context, id, args, result);
-                    case "dock_glass_status" -> result.complete(status(id));
-                    case "dock_glass_release" -> { release(id); result.complete(Bundle.EMPTY); }
-                    default -> throw new IllegalArgumentException("Unknown glass operation");
-                }
-            } catch (Throwable error) {
-                release(id);
-                record(id, "failed: " + error.getClass().getSimpleName() + ": " + error.getMessage());
-                Log.w(TAG, "Glass host unavailable; retain compositor fallback", error);
-                Bundle failure = new Bundle();
-                failure.putString("error", error.getClass().getSimpleName() + ": " + error.getMessage());
-                result.complete(failure);
-            }
-        });
+        main.post(() -> dispatch(context, method, id, args, result));
         try {
             return result.get(5, TimeUnit.SECONDS);
-        } catch (Exception error) {
-            if (error instanceof InterruptedException) Thread.currentThread().interrupt();
-            result.cancel(false);
-            main.post(() -> release(id));
-            Bundle failure = new Bundle();
-            Throwable cause = error.getCause() == null ? error : error.getCause();
-            failure.putString("error", cause.getClass().getSimpleName() + ": " + cause.getMessage());
-            return failure;
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            return cancelRequest(id, result, error);
+        } catch (ExecutionException | TimeoutException error) {
+            return cancelRequest(id, result, error);
         }
+    }
+
+    private void dispatch(Context context, String method, String id, Bundle args, CompletableFuture<Bundle> result) {
+        if (result.isDone()) return;
+        try {
+            switch (method) {
+                case "dock_glass_diagnostics" -> result.complete(diagnostics());
+                case "dock_glass_create" -> create(context, id, args, result);
+                case "dock_glass_status" -> result.complete(status(id));
+                case "dock_glass_release" -> { release(id); result.complete(Bundle.EMPTY); }
+                default -> throw new IllegalArgumentException("Unknown glass operation");
+            }
+        } catch (Throwable error) {
+            release(id);
+            record(id, "failed: " + error.getClass().getSimpleName() + ": " + error.getMessage());
+            Log.w(TAG, "Glass host unavailable; retain compositor fallback", error);
+            result.complete(failure(error));
+        }
+    }
+
+    private Bundle cancelRequest(String id, CompletableFuture<Bundle> result, Exception error) {
+        result.cancel(false);
+        main.post(() -> release(id));
+        return failure(error);
+    }
+
+    private static Bundle failure(Throwable error) {
+        Bundle failure = new Bundle();
+        Throwable cause = error.getCause() == null ? error : error.getCause();
+        failure.putString("error", cause.getClass().getSimpleName() + ": " + cause.getMessage());
+        return failure;
     }
 
     private void create(Context context, String id, Bundle args, CompletableFuture<Bundle> result)
             throws Exception {
         if (args == null) throw new IllegalArgumentException("Missing host configuration");
         if (!id.startsWith("self-test-")) { dockCreates++; record(id, "creating"); }
-        int width = args.getInt("width"), height = args.getInt("height");
+        int width = args.getInt("width");
+        int height = args.getInt("height");
         float radius = args.getFloat("radius");
         IBinder owner = args.getBinder("owner");
-        if (width < 1 || height < 1 || width > 4096 || height > 4096
-                || !Float.isFinite(radius) || radius < 0 || radius > Math.min(width, height) / 2f
-                || owner == null || !owner.isBinderAlive()) {
-            throw new IllegalArgumentException("Invalid host dimensions or owner");
-        }
-        Class<?> rootClass = Class.forName("android.view.ViewRootImpl");
-        if (!Boolean.TRUE.equals(HiddenApiBypass.invoke(rootClass, null, "getSupportedBionicMaterial"))
-                || !Boolean.TRUE.equals(HiddenApiBypass.invoke(rootClass, null, "getSupportedMiBlur"))) {
-            throw new UnsupportedOperationException("Native glass or cross-window blur is unsupported");
-        }
+        validateHost(width, height, radius, owner);
+        requireGlassSupport();
         release(id);
         if (entries.size() >= 2) throw new IllegalStateException("Dock host limit reached");
         Display display = context.getSystemService(DisplayManager.class).getDisplay(Display.DEFAULT_DISPLAY);
@@ -146,7 +162,8 @@ final class DockGlassHost {
         backdrop.addView(view, new FrameLayout.LayoutParams(width, height));
         SurfaceControlViewHost host = new SurfaceControlViewHost(displayContext, display, new Binder());
         IBinder.DeathRecipient death = () -> main.post(() -> release(id));
-        entries.put(id, new Entry(host, view, backdrop, owner, death));
+        Entry entry = new Entry(host, view, backdrop, owner, death);
+        entries.put(id, entry);
         owner.linkToDeath(death, 0);
         WindowManager.LayoutParams layout = new WindowManager.LayoutParams(width, height,
                 WindowManager.LayoutParams.TYPE_APPLICATION,
@@ -157,59 +174,83 @@ final class DockGlassHost {
         layout.setTitle("HyperCeiler Dock glass");
         HiddenApiBypass.invoke(SurfaceControlViewHost.class, host, "setView", backdrop, layout);
         // setView schedules attachment; configure only after the View has a ViewRootImpl.
-        view.post(() -> {
-            if (result.isDone() || !entries.containsKey(id)) return;
-            try {
-                if (!view.isAttachedToWindow() || !view.isHardwareAccelerated()) {
-                    throw new UnsupportedOperationException("No hardware-accelerated ViewRoot");
-                }
-                if (!enableOwnBackground(backdrop)) {
-                    throw new UnsupportedOperationException("Cross-window background was rejected");
-                }
-                invoke(backdrop, "setMiBackgroundBlurMode", 1);
-                invoke(backdrop, "setMiBackgroundBlurRadius", 120);
-                invoke(backdrop, "setMiViewBlurMode", 0);
-                invoke(view, "setMiBackgroundBlurMode", 0);
-                invoke(view, "setMiViewBlurMode", 1);
-                invoke(backdrop, "setMiGlassBlurRadius", DockGlassPreset.SMALL_BLUR_RADIUS,
-                        DockGlassPreset.BIG_BLUR_RADIUS);
-                // CCMaterialToken clears its solid background and enables native glass
-                // clipping enhancement before BionicsStyle applies the material token.
-                try {
-                    invoke(view, "setMiBackgroundBlurEnhanceFlag", DockGlassPreset.GLASS_ENHANCE_FLAG,
-                            DockGlassPreset.GLASS_ENHANCE_FLAG);
-                    view.setClipToOutline(false);
-                } catch (Exception unsupported) {
-                    // Older vendor APIs retain the ordinary rounded-outline clipping.
-                    Log.i(TAG, "Glass clip enhancement unavailable; rounded outline retained");
-                }
-                invoke(view, "setMiViewMaterialType", DockGlassPreset.MATERIAL_TYPE);
-                invoke(view, "setMiGlass", (Object) DockGlassPreset.parameters(args.getBoolean("dark")));
-                view.getViewTreeObserver().registerFrameCommitCallback(() -> main.post(() -> {
-                    if (result.isDone() || !entries.containsKey(id)) return;
-                    SurfaceControlViewHost.SurfacePackage surface = host.getSurfacePackage();
-                    if (surface == null) {
-                        result.completeExceptionally(new IllegalStateException("No surface package"));
-                        release(id);
-                        return;
-                    }
-                    Bundle response = new Bundle();
-                    response.putParcelable("surface", surface);
-                    response.putBinder("lifetime", lifetime);
-                    if (!result.complete(response)) { surface.release(); release(id); return; }
-                    entries.get(id).parcel = surface;
-                    // ContentProvider serializes the package after call() returns; do not release it here.
-                    Log.i(TAG, "Native glass frame committed for Dock host " + id);
-                    record(id, "frame committed; awaiting background texture; pipeline=container+glassChild");
-                }));
-                view.invalidate();
-            } catch (Throwable error) {
-                release(id);
-                record(id, "configuration failed: " + error.getClass().getSimpleName() + ": " + error.getMessage());
-                result.completeExceptionally(error);
-                Log.w(TAG, "Native glass configuration failed", error);
+        view.post(() -> configure(id, entry, args.getBoolean("dark"), result));
+    }
+
+    private static void validateHost(int width, int height, float radius, IBinder owner) {
+        if (width < 1 || height < 1 || width > 4096 || height > 4096) {
+            throw new IllegalArgumentException("Invalid host dimensions");
+        }
+        if (!Float.isFinite(radius) || radius < 0 || radius > Math.min(width, height) / 2f) {
+            throw new IllegalArgumentException("Invalid host radius");
+        }
+        if (owner == null || !owner.isBinderAlive()) throw new IllegalArgumentException("Invalid host owner");
+    }
+
+    private static void requireGlassSupport() throws Exception {
+        Class<?> rootClass = Class.forName("android.view.ViewRootImpl");
+        if (!Boolean.TRUE.equals(HiddenApiBypass.invoke(rootClass, null, "getSupportedBionicMaterial"))
+                || !Boolean.TRUE.equals(HiddenApiBypass.invoke(rootClass, null, "getSupportedMiBlur"))) {
+            throw new UnsupportedOperationException("Native glass or cross-window blur is unsupported");
+        }
+    }
+
+    private void configure(String id, Entry entry, boolean dark, CompletableFuture<Bundle> result) {
+        View view = entry.view;
+        View backdrop = entry.backdrop;
+        if (result.isDone() || !entries.containsKey(id)) return;
+        try {
+            if (!view.isAttachedToWindow() || !view.isHardwareAccelerated()) {
+                throw new UnsupportedOperationException("No hardware-accelerated ViewRoot");
             }
-        });
+            if (!enableOwnBackground(backdrop)) {
+                throw new UnsupportedOperationException("Cross-window background was rejected");
+            }
+            invoke(backdrop, "setMiBackgroundBlurMode", 1);
+            invoke(backdrop, "setMiBackgroundBlurRadius", 120);
+            invoke(backdrop, "setMiViewBlurMode", 0);
+            invoke(view, "setMiBackgroundBlurMode", 0);
+            invoke(view, "setMiViewBlurMode", 1);
+            invoke(backdrop, "setMiGlassBlurRadius", DockGlassPreset.SMALL_BLUR_RADIUS,
+                    DockGlassPreset.BIG_BLUR_RADIUS);
+            // CCMaterialToken clears its solid background and enables native glass
+            // clipping enhancement before BionicsStyle applies the material token.
+            try {
+                invoke(view, "setMiBackgroundBlurEnhanceFlag", DockGlassPreset.GLASS_ENHANCE_FLAG,
+                        DockGlassPreset.GLASS_ENHANCE_FLAG);
+                view.setClipToOutline(false);
+            } catch (Exception unsupported) {
+                // Older vendor APIs retain the ordinary rounded-outline clipping.
+                Log.i(TAG, "Glass clip enhancement unavailable; rounded outline retained");
+            }
+            invoke(view, "setMiViewMaterialType", DockGlassPreset.MATERIAL_TYPE);
+            invoke(view, "setMiGlass", (Object) DockGlassPreset.parameters(dark));
+            view.getViewTreeObserver().registerFrameCommitCallback(() -> main.post(() -> commitFrame(id, entry, result)));
+            view.invalidate();
+        } catch (Throwable error) {
+            release(id);
+            record(id, "configuration failed: " + error.getClass().getSimpleName() + ": " + error.getMessage());
+            result.completeExceptionally(error);
+            Log.w(TAG, "Native glass configuration failed", error);
+        }
+    }
+
+    private void commitFrame(String id, Entry entry, CompletableFuture<Bundle> result) {
+        if (result.isDone() || !entries.containsKey(id)) return;
+        SurfaceControlViewHost.SurfacePackage surface = entry.host.getSurfacePackage();
+        if (surface == null) {
+            result.completeExceptionally(new IllegalStateException("No surface package"));
+            release(id);
+            return;
+        }
+        Bundle response = new Bundle();
+        response.putParcelable("surface", surface);
+        response.putBinder("lifetime", lifetime);
+        if (!result.complete(response)) { surface.release(); release(id); return; }
+        entry.parcel = surface;
+        // ContentProvider serializes the package after call() returns; do not release it here.
+        Log.i(TAG, "Native glass frame committed for Dock host " + id);
+        record(id, "frame committed; awaiting background texture; pipeline=container+glassChild");
     }
 
     private Bundle status(String id) throws Exception {
@@ -219,14 +260,12 @@ final class DockGlassHost {
         long timestamp = 0;
         if (entry != null && entry.view.isAttachedToWindow()) {
             Object root = invoke(entry.view, "getViewRootImpl");
-            for (Field field : HiddenApiBypass.getInstanceFields(root.getClass())) {
-                if (!field.getName().equals("mSurTex")) continue;
-                field.setAccessible(true);
+            Field field = ownField(root.getClass(), "mSurTex");
+            if (field != null) {
                 Object texture = field.get(root);
                 // Only a timestamp, never copy, retain or expose background pixels.
                 if (texture instanceof SurfaceTexture) timestamp = ((SurfaceTexture) texture).getTimestamp();
                 ready = timestamp > 0;
-                break;
             }
         }
         result.putBoolean("backgroundReady", ready);
@@ -270,11 +309,13 @@ final class DockGlassHost {
             Bundle rendered = result.get(5, TimeUnit.SECONDS);
             response.putBoolean("frameCommitted", rendered.containsKey("surface"));
             response.putString("note", "Unparented HWUI smoke test only; desktop background not verified");
-        } catch (Exception error) {
-            if (error instanceof InterruptedException) Thread.currentThread().interrupt();
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
             result.cancel(false);
-            Throwable cause = error.getCause() == null ? error : error.getCause();
-            response.putString("error", cause.getClass().getSimpleName() + ": " + cause.getMessage());
+            response.putAll(failure(error));
+        } catch (ExecutionException | TimeoutException error) {
+            result.cancel(false);
+            response.putAll(failure(error));
         } finally {
             main.post(() -> release(id));
         }
@@ -288,16 +329,16 @@ final class DockGlassHost {
     private static boolean enableOwnBackground(View view) throws Exception {
         if (Boolean.TRUE.equals(invoke(view, "setPassWindowBlurEnabled", true))) return true;
         // A false return can also mean the requested state is already set.
-        for (Field field : HiddenApiBypass.getInstanceFields(View.class)) {
-            if (!field.getName().equals("mNeedPassWindowBlur")) continue;
-            field.setAccessible(true);
-            if (field.getBoolean(view)) return true;
-        }
+        Field enabledField = ownField(View.class, "mNeedPassWindowBlur");
+        if (enabledField != null && enabledField.getBoolean(view)) return true;
         Object root = invoke(view, "getViewRootImpl");
         if (root == null) return false;
-        for (Field field : HiddenApiBypass.getInstanceFields(root.getClass())) {
-            if (!field.getName().equals("mPassWindowBlurFilterData")) continue;
-            field.setAccessible(true);
+        return allowOwnBackground(view, root);
+    }
+
+    private static boolean allowOwnBackground(View view, Object root) throws Exception {
+        Field field = ownField(root.getClass(), "mPassWindowBlurFilterData");
+        if (field != null) {
             Object original = field.get(root);
             if (!(original instanceof String)) return false;
             String ownPackage = view.getContext().getPackageName();
@@ -310,6 +351,19 @@ final class DockGlassHost {
             return enabled;
         }
         return false;
+    }
+
+    // Vendor-only instance fields on HyperCeiler's own View/ViewRoot. Public API
+    // has no texture-readiness/filter accessor; do not apply this to host windows.
+    @SuppressWarnings("PMD.AvoidAccessibilityAlteration")
+    private static Field ownField(Class<?> type, String name) {
+        for (Field field : HiddenApiBypass.getInstanceFields(type)) {
+            if (field.getName().equals(name)) {
+                field.setAccessible(true);
+                return field;
+            }
+        }
+        return null;
     }
 
     private void release(String id) {

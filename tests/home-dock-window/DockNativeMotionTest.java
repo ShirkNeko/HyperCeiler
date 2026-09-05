@@ -1,3 +1,5 @@
+package com.sevtinge.hyperceiler.tests.dock;
+
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 import com.sevtinge.hyperceiler.libhook.rules.home.dock.DockNativeMotion;
 import com.sevtinge.hyperceiler.libhook.rules.home.dock.DockRecentsMotion;

@@ -1,3 +1,5 @@
+package com.sevtinge.hyperceiler.tests.dock;
+
 import com.sevtinge.hyperceiler.libhook.rules.home.dock.DockGlassRetryPolicy;
 
 public final class DockGlassRetryPolicyTest {

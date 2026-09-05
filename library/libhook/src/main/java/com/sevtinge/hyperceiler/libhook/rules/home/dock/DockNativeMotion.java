@@ -8,6 +8,9 @@ import java.nio.ByteOrder;
 public final class DockNativeMotion {
     public static final int PACKET_SIZE = 32;
     public static final long MAX_AGE_NS = 150_000_000L;
+    private long sequence;
+    private boolean recents;
+    private float progress;
     public record Sample(long sequence, long uptimeNanos, int scene, double scale) { }
 
     public static Sample decode(byte[] bytes, long previousSequence, long nowNanos) {
@@ -24,10 +27,6 @@ public final class DockNativeMotion {
                 || !Double.isFinite(scale) || scale < 0 || scale > 2) return null;
         return new Sample(sequence, timestamp, scene, scale);
     }
-
-    private long sequence;
-    private boolean recents;
-    private float progress;
 
     public boolean accept(Sample sample) {
         if (sample == null || sample.sequence() <= sequence) return false;

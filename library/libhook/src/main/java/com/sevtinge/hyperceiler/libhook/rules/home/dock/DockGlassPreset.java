@@ -3,14 +3,14 @@ package com.sevtinge.hyperceiler.libhook.rules.home.dock;
 
 /** OS4's 42-float HWUI ABI. See tests/home-dock-window/OS4_GLASS_NOTES.md. */
 public final class DockGlassPreset {
-    private DockGlassPreset() {}
-
     // New value: do not reuse 2, which means legacy custom blur on older systems.
     public static final int MODE = 3;
     public static final int MATERIAL_TYPE = 1;
     public static final int SMALL_BLUR_RADIUS = 110;
     public static final int BIG_BLUR_RADIUS = 110;
     public static final int GLASS_ENHANCE_FLAG = 0x2000;
+
+    private DockGlassPreset() {}
 
     /** Fresh arrays: native setters and callers must never mutate a shared preset. */
     public static float[] parameters(boolean dark) {

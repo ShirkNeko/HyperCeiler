@@ -36,14 +36,12 @@ object HomeGestureOS4 : BaseHook() {
             parameterTypes(MotionEvent::class.java)
         }.createBeforeHook { param ->
             val activity = param.thisObject as Activity
-            if (activity.componentName.className != LAUNCHER_ACTIVITY) return@createBeforeHook
-
-            val event = param.args[0] as MotionEvent
-            val state = states.getOrPut(activity) {
-                GestureState(ViewConfiguration.get(activity).scaledTouchSlop * 2)
-            }
-            if (state.handle(activity, event)) {
-                param.result = true
+            if (activity.componentName.className == LAUNCHER_ACTIVITY) {
+                val event = param.args[0] as MotionEvent
+                val state = states.getOrPut(activity) {
+                    GestureState(ViewConfiguration.get(activity).scaledTouchSlop * 2)
+                }
+                if (state.handle(activity, event)) param.result = true
             }
         }
     }

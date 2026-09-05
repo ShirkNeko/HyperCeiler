@@ -1,3 +1,5 @@
+package com.sevtinge.hyperceiler.tests.dock;
+
 import com.sevtinge.hyperceiler.libhook.rules.home.dock.DockRecentsMotion;
 
 public class DockRecentsMotionTest {

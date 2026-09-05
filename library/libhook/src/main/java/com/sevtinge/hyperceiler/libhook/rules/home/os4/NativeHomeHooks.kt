@@ -8,6 +8,7 @@ import androidx.annotation.Keep
 import com.sevtinge.hyperceiler.common.log.XposedLog
 import com.sevtinge.hyperceiler.common.utils.PrefsBridge
 
+/** Configures native property hooks, with a library-load fallback for legacy loaders. */
 @Keep
 object NativeHomeHooks {
     private external fun nativeConfigure(
@@ -16,6 +17,7 @@ object NativeHomeHooks {
         softGlass: Boolean
     )
 
+    /** Apply current launcher preferences to the process-local native hooks. */
     fun init() {
         val configure = {
             nativeConfigure(

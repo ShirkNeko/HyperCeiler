@@ -42,6 +42,8 @@ public final class DockWallpaperEndpoint {
 
     public static boolean ownsWindow(Object expectedSession, Object expectedToken,
                                      Object actualSession, Object actualToken) {
+        // Session must be the very same WMS object, not a caller-defined value
+        // comparison. Binder tokens retain their platform equality semantics.
         return expectedSession != null && expectedToken != null
                 && expectedSession == actualSession && expectedToken.equals(actualToken);
     }

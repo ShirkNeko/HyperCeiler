@@ -4,6 +4,7 @@ package com.sevtinge.hyperceiler.libhook.rules.home.dock
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import java.io.DataInputStream
+import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** One reader per exact visible launcher window. No socket I/O on a WMS thread. */
@@ -17,6 +18,7 @@ internal class DockNativeMotionClient(
     @Volatile var connected = false
         private set
     private val closed = AtomicBoolean(false)
+    private var callbackFailureReported = false // Reader thread only.
     @Volatile private var socket: LocalSocket? = null
     private val reader = Thread({ readLoop() }, "HyperCeiler-DockMotion").apply { isDaemon = true }
 
@@ -30,39 +32,61 @@ internal class DockNativeMotionClient(
             socket = current
             try {
                 if (closed.get()) break
-                current.connect(LocalSocketAddress("hyperceiler.dock.motion.$pid", LocalSocketAddress.Namespace.ABSTRACT))
-                val peer = current.peerCredentials
-                check(peer.uid == uid && peer.pid == pid) { "Wrong launcher socket owner" }
-                var sequence = 0L
-                val packet = ByteArray(DockNativeMotion.PACKET_SIZE)
-                val input = DataInputStream(current.inputStream)
-                while (!closed.get()) {
-                    input.readFully(packet)
-                    val sample = DockNativeMotion.decode(packet, sequence, System.nanoTime())
-                        ?: error("Invalid/stale native motion packet")
-                    sequence = sample.sequence()
-                    latest = sample
-                    if (!connected) {
-                        connected = true
-                        diagnostic("native motion connected uid=$uid pid=$pid")
-                    }
-                    changed()
-                }
-            } catch (error: Exception) {
-                if (!closed.get() && (failures == 0 || failures == 7)) {
-                    diagnostic("native motion unavailable attempt=${failures + 1} error=${error.javaClass.simpleName}: ${error.message?.take(100)}")
-                }
+                readConnection(current)
+            } catch (error: IOException) {
+                reportFailure(error, failures)
+            } catch (error: SecurityException) {
+                reportFailure(error, failures)
             } finally {
                 connected = false
                 latest = null
                 runCatching { current.close() }
                 if (socket === current) socket = null
-                if (!closed.get()) changed()
+                if (!closed.get()) notifyChanged()
             }
             failures++
             if (!closed.get()) {
                 try { Thread.sleep(minOf(5000L, 500L shl minOf(failures - 1, 4))) }
                 catch (_: InterruptedException) { break }
+            }
+        }
+    }
+
+    private fun readConnection(current: LocalSocket) {
+        current.connect(LocalSocketAddress("hyperceiler.dock.motion.$pid", LocalSocketAddress.Namespace.ABSTRACT))
+        val peer = current.peerCredentials
+        if (peer.uid != uid || peer.pid != pid) throw SecurityException("Wrong launcher socket owner")
+        var sequence = 0L
+        val packet = ByteArray(DockNativeMotion.PACKET_SIZE)
+        val input = DataInputStream(current.inputStream)
+        while (!closed.get()) {
+            input.readFully(packet)
+            val sample = DockNativeMotion.decode(packet, sequence, System.nanoTime())
+                ?: throw IOException("Invalid/stale native motion packet")
+            sequence = sample.sequence()
+            latest = sample
+            if (!connected) {
+                connected = true
+                diagnostic("native motion connected uid=$uid pid=$pid")
+            }
+            notifyChanged()
+        }
+    }
+
+    private fun reportFailure(error: Exception, failures: Int) {
+        if (!closed.get() && (failures == 0 || failures == 7)) {
+            diagnostic("native motion unavailable attempt=${failures + 1} error=${error.javaClass.simpleName}: ${error.message?.take(100)}")
+        }
+    }
+
+    private fun notifyChanged() {
+        // Transport errors have specific catches above. The optional WMS callback
+        // is a separate failure boundary: a vendor reflection failure must never
+        // escape this system_server worker's uncaught-exception handler.
+        runCatching(changed).onFailure {
+            if (!callbackFailureReported) {
+                callbackFailureReported = true
+                diagnostic("native motion callback unavailable: ${it.javaClass.simpleName}")
             }
         }
     }

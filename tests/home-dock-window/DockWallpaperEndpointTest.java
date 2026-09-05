@@ -1,3 +1,5 @@
+package com.sevtinge.hyperceiler.tests.dock;
+
 import com.sevtinge.hyperceiler.libhook.rules.home.dock.DockWallpaperEndpoint;
 
 public final class DockWallpaperEndpointTest {
@@ -6,20 +8,20 @@ public final class DockWallpaperEndpointTest {
     static final class Data {}
     static final class Empty {}
     static final class Modern {
-        void sendWindowWallpaperCommand(Window w, String action, int x, int y, int z, Data extras) {}
+        void sendWindowWallpaperCommand(Window w, String action, int x, int y, int z, Data extras) { /* Signature fixture only. */ }
     }
     static final class Legacy {
         Data sendWindowWallpaperCommandUnchecked(Window w, String action, int x, int y, int z, Data extras, boolean sync) { return null; }
     }
     static final class ModernSession {
-        void sendWallpaperCommand(Token token, String action, int x, int y, int z, Data extras) {}
+        void sendWallpaperCommand(Token token, String action, int x, int y, int z, Data extras) { /* Signature fixture only. */ }
     }
     static final class LegacySession {
         Data sendWallpaperCommand(Token token, String action, int x, int y, int z, Data extras, boolean sync) { return null; }
     }
     static final class GlobalOnly {
-        void sendWallpaperCommand(String action, int x, int y, int z, Data extras) {}
-        void sendWindowWallpaperCommand(String action, int x, int y, int z, Data extras) {}
+        void sendWallpaperCommand(String action, int x, int y, int z, Data extras) { /* Rejected unscoped fixture. */ }
+        void sendWindowWallpaperCommand(String action, int x, int y, int z, Data extras) { /* Rejected unscoped fixture. */ }
     }
     static final class WrongReturn {
         String sendWindowWallpaperCommand(Window w, String action, int x, int y, int z, Data extras) { return null; }
@@ -48,7 +50,8 @@ public final class DockWallpaperEndpointTest {
         } catch (NoSuchMethodException expected) {
             // An unsupported vendor endpoint must leave the static background intact.
         }
-        Object owner = new Object(), token = new Object();
+        Object owner = new Object();
+        Object token = new Object();
         check(DockWallpaperEndpoint.ownsWindow(owner, token, owner, token), "both identities match");
         check(!DockWallpaperEndpoint.ownsWindow(owner, token, new Object(), token), "reject foreign session");
         check(!DockWallpaperEndpoint.ownsWindow(owner, token, owner, new Object()), "reject another window in same session");

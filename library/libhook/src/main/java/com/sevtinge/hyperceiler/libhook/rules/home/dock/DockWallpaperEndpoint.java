@@ -40,6 +40,7 @@ public final class DockWallpaperEndpoint {
         }
     }
 
+    @SuppressWarnings("ReferenceEquality") // Intentional: session must be the same WMS object instance
     public static boolean ownsWindow(Object expectedSession, Object expectedToken,
                                      Object actualSession, Object actualToken) {
         // Session must be the very same WMS object, not a caller-defined value

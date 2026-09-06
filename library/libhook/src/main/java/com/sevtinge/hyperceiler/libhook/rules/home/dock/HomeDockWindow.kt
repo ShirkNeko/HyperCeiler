@@ -31,6 +31,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class HomeDockWindow : BaseHook() {
     private companion object {
+        const val LOG_TAG = "system"
         const val WM_HANDLER = "mH"
         const val WM_LOCK = "mGlobalLock"
         const val IS_VALID = "isValid"
@@ -152,7 +153,7 @@ class HomeDockWindow : BaseHook() {
             }
         }
         WindowHooks(loadClass("com.android.server.wm.WindowState")).install()
-        XposedLog.i(TAG, "system", "WMS dock hook ready: enabled=${settings.enabled}, blur=${settings.blur}")
+        XposedLog.i(TAG, LOG_TAG, "WMS dock hook ready: enabled=${settings.enabled}, blur=${settings.blur}")
     }
 
     /** Keeps optional scene-hook failures separate from the background's lifecycle. */
@@ -175,7 +176,7 @@ class HomeDockWindow : BaseHook() {
             synchronized(layers) {
                 if (stopped) return
                 if (settings.enabled && observed.size < 12 && observed.add("${attrs.type}:$title")) {
-                    XposedLog.i(TAG, "system", "Launcher window: type=${attrs.type}, title=${title.take(160)}")
+                    XposedLog.i(TAG, LOG_TAG, "Launcher window: type=${attrs.type}, title=${title.take(160)}")
                 }
                 if (!isLauncher(window, attrs)) return
                 service = window.getObjectFieldAs<Any>("mWmService")
@@ -197,11 +198,11 @@ class HomeDockWindow : BaseHook() {
                 command.createAfterHook { param ->
                     runCatching { wallpaperCommand(endpoint, param) }.onFailure { reportMotionError(it) }
                 }
-                XposedLog.i(TAG, "system", "Dock recents motion observer ready")
+                XposedLog.i(TAG, LOG_TAG, "Dock recents motion observer ready")
                 glassClient.record("motion observer ready endpoint=${command.toGenericString()}")
             }.onFailure {
                 glassClient.record("motion observer unsupported=${it.javaClass.simpleName}: ${it.message?.take(160)}")
-                XposedLog.w(TAG, "system", "Dock recents motion unsupported; keeping background", it)
+                XposedLog.w(TAG, LOG_TAG, "Dock recents motion unsupported; keeping background", it)
             }
         }
 
@@ -267,7 +268,7 @@ class HomeDockWindow : BaseHook() {
             synchronized(layers) {
                 if (observed.add("recents-motion-error")) {
                     glassClient.record("motion observer error=${error.javaClass.simpleName}: ${error.message?.take(160)}")
-                    XposedLog.w(TAG, "system", "Dock recents signal unavailable; keeping background", error)
+                    XposedLog.w(TAG, LOG_TAG, "Dock recents signal unavailable; keeping background", error)
                 }
             }
         }
@@ -365,9 +366,9 @@ class HomeDockWindow : BaseHook() {
                     motionLayer.motionClient = null
                     glassClient.record("motion window identity unavailable=${it.javaClass.simpleName}")
                 }
-                XposedLog.i(TAG, "system", "Dock surface created: frame=$frame, bounds=$bounds, blur=${config.blur}")
+                XposedLog.i(TAG, LOG_TAG, "Dock surface created: frame=$frame, bounds=$bounds, blur=${config.blur}")
                 if (!config.blur && Color.alpha(config.color) == 0) {
-                    XposedLog.w(TAG, "system", "Dock color is transparent; select a visible color or enable blur")
+                    XposedLog.w(TAG, LOG_TAG, "Dock color is transparent; select a visible color or enable blur")
                 }
             }
             return layer
@@ -393,7 +394,7 @@ class HomeDockWindow : BaseHook() {
                     if (config.blur && !(glassReady && glass?.dead == false)) 120 else 0) }
                     .onFailure {
                         blurAvailable = false
-                        XposedLog.w(TAG, "system", "Compositor blur unavailable; retaining color fallback", it)
+                        XposedLog.w(TAG, LOG_TAG, "Compositor blur unavailable; retaining color fallback", it)
                     }
             }
             val color = when {
@@ -571,7 +572,7 @@ class HomeDockWindow : BaseHook() {
                 animationAvailable = false
                 frameScheduled.set(false)
                 glassClient.record("motion scheduling failed=${it.javaClass.simpleName}: ${it.message?.take(160)}")
-                XposedLog.w(TAG, "system", "Dock animation scheduling unavailable; using scene endpoints", it)
+                XposedLog.w(TAG, LOG_TAG, "Dock animation scheduling unavailable; using scene endpoints", it)
                 requestTraversal()
             }
         }
@@ -585,7 +586,7 @@ class HomeDockWindow : BaseHook() {
             layers.keys.toList().forEach { removeLayer(it) }
             glassClient.close()
             processGuard.close()
-            XposedLog.e(TAG, "system", "WMS dock disabled after an error; system windows left unchanged", error)
+            XposedLog.e(TAG, LOG_TAG, "WMS dock disabled after an error; system windows left unchanged", error)
         }
     }
 }

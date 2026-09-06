@@ -1,3 +1,5 @@
+* SPDX-License-Identifier: AGPL-3.0-or-later *
+#pragma GCC diagnostic ignored "-Wunused-member"
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 #include "../../app/src/main/cpp/dock_native_resolver.h"
 #include <cassert>

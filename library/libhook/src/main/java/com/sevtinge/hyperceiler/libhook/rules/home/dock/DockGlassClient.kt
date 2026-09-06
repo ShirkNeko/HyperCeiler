@@ -176,7 +176,7 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
             changed()
             // Parent first, then wait for the vendor background texture, not just a drawn buffer.
             checkBackground(ticket, 0, generation)
-        } catch (error: Throwable) {
+        } catch (error: Exception) {
             recover(ticket, "create ${error.javaClass.simpleName}: ${error.message?.take(160)}")
         }
     }
@@ -197,7 +197,7 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
                 } else {
                     recover(ticket, "background texture timeout after ${attempt + 1} checks")
                 }
-            } catch (error: Throwable) {
+            } catch (error: Exception) {
                 recover(ticket, "status ${error.javaClass.simpleName}: ${error.message?.take(160)}")
             }
         }, 500)
@@ -208,7 +208,8 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
         // Never queue remote reparent operations in WMS's deferred sync transaction:
         // it could commit AFTER worker cleanup and resurrect a retired surface.
         worker.post {
-            if (closed || ticket.cancelled || ticket.dead || ticket.lease !== lease) return@post
+            val shouldSkip = closed || ticket.cancelled || ticket.dead || ticket.lease !== lease
+            if (shouldSkip) return@post
             runCatching { lease.attach(parent) }.onFailure {
                 recover(ticket, "surface attachment failed: ${it.javaClass.simpleName}")
             }

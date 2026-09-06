@@ -61,7 +61,7 @@ internal class DockGlassProcessGuard {
                     "Renderer could not be thawed"
                 }
             }
-        } catch (error: Exception) {
+        } catch (error: ReflectiveOperationException) {
             policy.release(token)
             throw error
         }

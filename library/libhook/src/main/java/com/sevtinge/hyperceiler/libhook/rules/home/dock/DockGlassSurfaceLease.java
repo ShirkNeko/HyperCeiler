@@ -3,16 +3,16 @@ package com.sevtinge.hyperceiler.libhook.rules.home.dock;
 
 /** One renderer generation. All operations run on the same serial worker. */
 public final class DockGlassSurfaceLease implements AutoCloseable {
+    private final Operations operations;
+    private boolean attached;
+    private boolean retired;
+    private boolean released;
+
     public interface Operations {
         void attach(Object parent);
         void detach();
         void release();
     }
-
-    private final Operations operations;
-    private boolean attached;
-    private boolean retired;
-    private boolean released;
 
     public DockGlassSurfaceLease(Operations operations) {
         this.operations = operations;

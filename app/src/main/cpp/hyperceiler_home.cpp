@@ -30,7 +30,7 @@ struct NativeApiEntries {
     // Loader-owned ABI: unused optional entries still occupy their original slots.
     uint32_t version;
     HookFunction hook_func;
-    UnhookFunction unhook_func;
+    [[maybe_unused]] UnhookFunction unhook_func;
 };
 
 HookFunction g_hook_function = nullptr;

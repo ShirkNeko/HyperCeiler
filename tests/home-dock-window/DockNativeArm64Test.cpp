@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
+#pragma GCC diagnostic ignored "-Wunused-member"
 #include <atomic>
 #include <bit>
 #include <cassert>

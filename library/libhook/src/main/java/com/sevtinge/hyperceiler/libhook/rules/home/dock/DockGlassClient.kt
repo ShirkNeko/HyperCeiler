@@ -11,17 +11,18 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.os.SystemClock
 import android.util.Log
+import android.view.SurfaceControl
 import android.view.SurfaceControlViewHost
 import com.sevtinge.hyperceiler.common.log.XposedLog
 import io.github.lingqiqi5211.ezhooktool.core.callMethod
 import java.util.UUID
 
 /** No provider IPC, waiting or HWUI work on the WMS thread/under the global WM lock. */
-internal class DockGlassClient(private val changed: () -> Unit) {
+internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, private val changed: () -> Unit) {
     class Ticket(val key: String, val context: Context,
         val bounds: DockWindowPolicy.Bounds, val dark: Boolean) {
         val id: String = UUID.randomUUID().toString()
-        @Volatile var surface: Any? = null
+        @Volatile var lease: DockGlassSurfaceLease? = null
         @Volatile var ready = false
         @Volatile var dead = false
         @Volatile var cancelled = false
@@ -124,6 +125,8 @@ internal class DockGlassClient(private val changed: () -> Unit) {
         ticket.dead = false
         record("glass create id=${ticket.id} attempt=${ticket.attempts}")
         try {
+            check(dispose(ticket)) { "Previous glass surface could not be detached" }
+            processGuard.acquire(ticket.context, ticket)
             val bounds = ticket.bounds
             val args = Bundle().apply {
                 putInt("width", bounds.width()); putInt("height", bounds.height())
@@ -131,6 +134,7 @@ internal class DockGlassClient(private val changed: () -> Unit) {
                 putBinder("owner", owner)
             }
             val response = ticket.request("dock_glass_create", args)
+            processGuard.setPid(ticket, response.getInt("rendererPid", -1))
             response.classLoader = SurfaceControlViewHost.SurfacePackage::class.java.classLoader
             ticket.parcel = response.getParcelable("surface", SurfaceControlViewHost.SurfacePackage::class.java)
                 ?: error(response.getString("error") ?: "Renderer returned no surface")
@@ -144,8 +148,31 @@ internal class DockGlassClient(private val changed: () -> Unit) {
             }
             ticket.death = death
             ticket.lifetime!!.linkToDeath(death, 0)
-            ticket.surface = ticket.parcel!!.callMethod("getSurfaceControl")
+            val parcel = ticket.parcel!!
+            val surface = parcel.callMethod("getSurfaceControl") as? SurfaceControl
                 ?: error("Renderer returned no SurfaceControl")
+            ticket.lease = DockGlassSurfaceLease(object : DockGlassSurfaceLease.Operations {
+                override fun attach(parent: Any) {
+                    SurfaceControl.Transaction().use { transaction ->
+                        transaction.reparent(surface, parent as SurfaceControl)
+                        transaction.setLayer(surface, 2)
+                        transaction.setPosition(surface, 0f, 0f)
+                        transaction.callMethod("setWindowCrop", surface, bounds.width(), bounds.height())
+                        transaction.callMethod("show", surface)
+                        transaction.apply()
+                    }
+                }
+
+                override fun detach() {
+                    // release() only drops our handle; an attached server-side root
+                    // otherwise survives renderer death underneath the Dock parent.
+                    if (surface.isValid) SurfaceControl.Transaction().use {
+                        it.reparent(surface, null).apply()
+                    }
+                }
+
+                override fun release() { parcel.release() }
+            })
             changed()
             // Parent first, then wait for the vendor background texture, not just a drawn buffer.
             checkBackground(ticket, 0, generation)
@@ -161,7 +188,7 @@ internal class DockGlassClient(private val changed: () -> Unit) {
             try {
                 val status = ticket.request("dock_glass_status")
                 status.getString("error")?.let { error(it) }
-                ticket.ready = status.getBoolean("backgroundReady")
+                ticket.ready = ticket.lease?.isAttached == true && status.getBoolean("backgroundReady")
                 if (ticket.ready) {
                     record("glass ready id=${ticket.id} attempt=${ticket.attempts} check=${attempt + 1}")
                     changed()
@@ -176,10 +203,16 @@ internal class DockGlassClient(private val changed: () -> Unit) {
         }, 500)
     }
 
-    fun surfaceFailed(ticket: Ticket) {
-        ticket.dead = true
-        ticket.ready = false
-        worker.post { recover(ticket, "surface attachment failed") }
+    fun attach(ticket: Ticket, parent: Any) {
+        val lease = ticket.lease ?: return
+        // Never queue remote reparent operations in WMS's deferred sync transaction:
+        // it could commit AFTER worker cleanup and resurrect a retired surface.
+        worker.post {
+            if (closed || ticket.cancelled || ticket.dead || ticket.lease !== lease) return@post
+            runCatching { lease.attach(parent) }.onFailure {
+                recover(ticket, "surface attachment failed: ${it.javaClass.simpleName}")
+            }
+        }
     }
 
     private fun recover(ticket: Ticket, reason: String) {
@@ -209,13 +242,21 @@ internal class DockGlassClient(private val changed: () -> Unit) {
         }
     }
 
-    private fun dispose(ticket: Ticket) {
+    private fun dispose(ticket: Ticket): Boolean {
         ticket.ready = false
-        ticket.surface = null
         ticket.death?.let { runCatching { ticket.lifetime?.unlinkToDeath(it, 0) } }
         ticket.death = null
         ticket.lifetime = null
-        runCatching { ticket.parcel?.release() }
+        try {
+            val lease = ticket.lease
+            if (lease != null) lease.close() else ticket.parcel?.release()
+        } catch (error: RuntimeException) {
+            // Keep the last handle and do not create another host until cleanup
+            // succeeds. Recovery's bounded backoff retries this same retirement.
+            record("glass detach failed id=${ticket.id}: ${error.javaClass.simpleName}")
+            return false
+        }
+        ticket.lease = null
         ticket.parcel = null
         // Do not reacquire/start a renderer merely to release a failed acquisition.
         try {
@@ -223,7 +264,9 @@ internal class DockGlassClient(private val changed: () -> Unit) {
         } finally {
             runCatching { ticket.client?.close() }
             ticket.client = null
+            processGuard.release(ticket)
         }
+        return true
     }
 
 }

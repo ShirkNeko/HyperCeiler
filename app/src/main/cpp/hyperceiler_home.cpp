@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string_view>
 
@@ -40,6 +41,15 @@ std::atomic_bool g_soft_glass = false;
 
 using SystemPropertyGet = int (*)(const char *name, char *value);
 SystemPropertyGet g_original_system_property_get = nullptr;
+
+bool is_launcher_process() {
+    char name[128]{};
+    FILE *file = std::fopen("/proc/self/cmdline", "r");
+    if (file == nullptr) return false;
+    const size_t size = std::fread(name, 1, sizeof(name) - 1, file);
+    std::fclose(file);
+    return size > 0 && std::string_view(name) == "com.miui.home";
+}
 
 bool is_prestart_property(std::string_view name) {
     return name == "persist.sys.usap_pool_enabled" ||
@@ -85,7 +95,7 @@ int hooked_system_property_get(const char *name, char *value) {
 }
 
 void install_property_hook() {
-    if (g_hook_function == nullptr ||
+    if (!is_launcher_process() || g_hook_function == nullptr ||
         g_property_hook_installed.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
@@ -109,6 +119,9 @@ void on_library_loaded(const char *name, void *) {
     if (library_name.ends_with("/libapp_launcher.so") ||
         library_name == "libapp_launcher.so") {
         install_property_hook();
+#ifdef HYPERCEILER_DOCK_NATIVE_MOTION
+        if (is_launcher_process()) start_dock_native_motion(g_hook_function);
+#endif
     }
 }
 
@@ -126,13 +139,14 @@ Java_com_sevtinge_hyperceiler_libhook_rules_home_os4_NativeHomeHooks_nativeConfi
 extern "C" [[gnu::visibility("default")]] [[gnu::used]]
 NativeOnModuleLoaded native_init(const NativeApiEntries *entries) {
     if (entries == nullptr || entries->hook_func == nullptr) return nullptr;
-    __android_log_print(ANDROID_LOG_INFO, kLogTag, "native hook API version=%u", entries->version);
+    __android_log_print(ANDROID_LOG_INFO, kLogTag, "native v11 hook API version=%u launcher=%d",
+        entries->version, is_launcher_process());
     g_hook_function = entries->hook_func;
     // Install before libapp_launcher/libapp run their static initialization and cache the
     // properties. The load callback remains as a retry path for unusual linker ordering.
     install_property_hook();
 #ifdef HYPERCEILER_DOCK_NATIVE_MOTION
-    start_dock_native_motion(g_hook_function);
+    if (is_launcher_process()) start_dock_native_motion(g_hook_function);
 #endif
     return on_library_loaded;
 }

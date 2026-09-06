@@ -86,7 +86,7 @@ class HomeDockWindow : BaseHook() {
 
     private data class Appearance(val config: Settings, val bounds: DockWindowPolicy.Bounds,
         val dark: Boolean, val visible: Boolean, val glass: DockGlassClient.Ticket?) {
-        val surface = glass?.surface
+        val surface = glass?.lease
         val ready = glass?.ready == true && !glass.dead && surface != null
         val key = "$config/$bounds/$dark/$visible/$surface/$ready/${glass?.dead}"
     }
@@ -110,7 +110,8 @@ class HomeDockWindow : BaseHook() {
     @Volatile private var service: Any? = null
     private var blurAvailable = true
     private var commandSamples = 0
-    private val glassClient = DockGlassClient { requestTraversal() }
+    private val processGuard = DockGlassProcessGuard()
+    private val glassClient = DockGlassClient(processGuard) { requestTraversal() }
     private val frameScheduled = AtomicBoolean(false)
     @Volatile private var animationAvailable = true
     @Volatile private var directMotionAvailable = true
@@ -125,7 +126,9 @@ class HomeDockWindow : BaseHook() {
     }
 
     override fun init() {
-        glassClient.record("hook init diagnosticVersion=8 enabled=${settings.enabled} mode=${settings.mode}")
+        glassClient.record("hook init diagnosticVersion=11 enabled=${settings.enabled} mode=${settings.mode}")
+        runCatching { processGuard.install() }
+            .onFailure { glassClient.record("renderer guard unavailable=${it.javaClass.simpleName}") }
         val prefs = PrefsBridge.getSharedPreferences()
         val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
             if (key == null || key.contains("home_dock_") || key.endsWith("home_other_home_mode")) {
@@ -139,6 +142,7 @@ class HomeDockWindow : BaseHook() {
             prefs.unregisterOnSharedPreferenceChangeListener(listener)
             synchronized(layers) { layers.keys.toList().forEach { removeLayer(it) } }
             glassClient.close()
+            processGuard.close()
             service?.getObjectFieldAs<Handler>(WM_HANDLER)?.post {
                 runCatching { animationChoreographer?.removeFrameCallback(animationFrame) }
                 runCatching { motionTransaction?.callMethod("close") }
@@ -380,16 +384,9 @@ class HomeDockWindow : BaseHook() {
             transaction.callMethod(SET_CROP, layer.tint, bounds.width(), bounds.height())
             transaction.callMethod(SET_RADIUS, layer.tint, bounds.radius())
             if (glassSurface != null && glass?.dead == false) {
-                // Only the HyperCeiler-owned package is reparented; never move the launcher surface.
-                runCatching {
-                    transaction.callMethod("reparent", glassSurface, layer.effect)
-                    transaction.callMethod(SET_LAYER, glassSurface, 2)
-                    transaction.callMethod(SET_POSITION, glassSurface, 0f, 0f)
-                    transaction.callMethod(SET_CROP, glassSurface, bounds.width(), bounds.height())
-                    transaction.callMethod("show", glassSurface)
-                }.onFailure {
-                    glassClient.surfaceFailed(glass)
-                }
+                // Remote root attachment and retirement share one serial worker.
+                // WMS still controls the owned parent's visibility and motion.
+                glassClient.attach(glass, layer.effect)
             }
             if (blurAvailable) {
                 runCatching { transaction.callMethod("setBackgroundBlurRadius", layer.effect,
@@ -587,6 +584,7 @@ class HomeDockWindow : BaseHook() {
             glassClient.record("hook disabled error=${error.javaClass.simpleName}: ${error.message?.take(160)}")
             layers.keys.toList().forEach { removeLayer(it) }
             glassClient.close()
+            processGuard.close()
             XposedLog.e(TAG, "system", "WMS dock disabled after an error; system windows left unchanged", error)
         }
     }

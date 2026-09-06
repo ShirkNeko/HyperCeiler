@@ -1,6 +1,22 @@
 # HyperOS 4 Dock window regression checks
 
 Current native implementation: [v8 dynamic resolution and verification](NATIVE_DYNAMIC_RESOLUTION.md).
+Java hook diagnostic version 10 additionally fixes remote glass surface lifetime:
+attach and detach are serialized on the IPC worker, never deferred in WMS's sync
+transaction. Each generation is explicitly reparented to null before releasing
+its SurfacePackage. Late attachment requests are rejected after retirement; a
+failed detach retains the handle and prevents creation until bounded recovery
+can clean it up. Parent visibility and recents motion remain WMS-controlled.
+`DockGlassSurfaceLeaseTest` covers repeated renderer generations, late attaches,
+partial attachment, failed-detach retry, cancellation and idempotent release.
+Device verification must additionally check that repeated renderer recovery does
+not accumulate old SurfaceControlViewHost / Dock glass layers in SurfaceFlinger.
+The renderer also has a private, direct-boot-aware bound service. An unstable
+provider reference alone allowed OS4 to freeze the rendering process, returning
+BR_FROZEN_REPLY and triggering provider-death recovery. The system hook binds
+only HyperCeiler's service for each glass generation and unbinds on disposal;
+no started/foreground service, freezer exemption or global setting is used.
+Verify this dependency disappears on Dock removal, mode change and hot reload.
 The probe/v7 sections below are historical investigation notes; their address
 profiles and opt-in probe have been removed and are not used by current builds.
 
@@ -29,16 +45,18 @@ javac -d "$dock_test_dir" \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassPreset.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockRecentsMotion.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassRetryPolicy.java \
+  library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassSurfaceLease.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockWallpaperEndpoint.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockNativeMotion.java \
   tests/home-dock-window/DockWindowPolicyTest.java \
   tests/home-dock-window/DockGlassPresetTest.java \
   tests/home-dock-window/DockRecentsMotionTest.java \
   tests/home-dock-window/DockGlassRetryPolicyTest.java \
+  tests/home-dock-window/DockGlassSurfaceLeaseTest.java \
   tests/home-dock-window/DockWallpaperEndpointTest.java \
   tests/home-dock-window/DockNativeMotionTest.java
-
-for test in DockWindowPolicy DockGlassPreset DockRecentsMotion DockGlassRetryPolicy DockWallpaperEndpoint DockNativeMotion; do
+  
+for test in DockWindowPolicy DockGlassPreset DockRecentsMotion DockGlassRetryPolicy DockGlassSurfaceLease DockWallpaperEndpoint DockNativeMotion; do
   java -cp "$dock_test_dir" "com.sevtinge.hyperceiler.tests.dock.${test}Test"
 done
 ```

@@ -246,6 +246,7 @@ final class DockGlassHost {
         Bundle response = new Bundle();
         response.putParcelable("surface", surface);
         response.putBinder("lifetime", lifetime);
+        response.putInt("rendererPid", Process.myPid());
         if (!result.complete(response)) { surface.release(); release(id); return; }
         entry.parcel = surface;
         // ContentProvider serializes the package after call() returns; do not release it here.

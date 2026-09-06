@@ -1,10 +1,12 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 #include "dock_native_layout.h"
+#include "dock_native_maps.h"
 #include <android/log.h>
 #include <atomic>
 #include <cerrno>
 #include <elf.h>
 #include <exception>
+#include <fstream>
 #include <link.h>
 #include <pthread.h>
 #include <string_view>
@@ -74,7 +76,19 @@ void *motion_worker(void *) {
     Candidate candidate;
     for (int attempt = 0; attempt < 30; ++attempt) {
         dl_iterate_phdr(inspect_library, &candidate);
-        if (candidate.found) break;
+        if (!candidate.resolution) {
+            std::ifstream maps("/proc/self/maps");
+            try {
+                const auto ranges = dock_motion::mapped_code_ranges(maps);
+                if (!ranges.empty()) {
+                    candidate.found = true;
+                    candidate.resolution = dock_motion::resolve(ranges);
+                }
+            } catch (const std::exception &) {
+                candidate.resolution.reset();
+            }
+        }
+        if (candidate.resolution) break;
         pause_startup();
     }
     if (!candidate.resolution) {
@@ -96,7 +110,7 @@ void *motion_worker(void *) {
         __android_log_print(ANDROID_LOG_WARN, kTag, "motion hooks unavailable; no subscription enabled");
         return nullptr;
     }
-    __android_log_print(ANDROID_LOG_INFO, kTag, "dynamic motion resolved: paramsCID=%u doubleCID=%u",
+    __android_log_print(ANDROID_LOG_INFO, kTag, "dynamic motion v11 resolved: paramsCID=%u doubleCID=%u",
         resolved.layout.params_class_id, resolved.layout.double_class_id);
     run_dock_motion();
     return nullptr;

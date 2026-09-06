@@ -109,7 +109,6 @@ class HomeDockWindow : BaseHook() {
     private val observed = HashSet<String>()
     @Volatile private var stopped = false
     @Volatile private var settings = Settings.read()
-    @Volatile private var autoHideState = 0 // 0=visible, 1=folder, 2=editPanel, 3=recents
     @Volatile private var service: Any? = null
     private var blurAvailable = true
     private var commandSamples = 0
@@ -253,8 +252,6 @@ class HomeDockWindow : BaseHook() {
             }
             val layer = layers[window] ?: return
             layer.overview = overview
-            // OS4 Flutter launcher: update auto-hide state based on overview/recents
-            autoHideState = if (overview) 3 else 0 // 3=recents, 0=visible
             val now = SystemClock.uptimeMillis()
             layer.motionTime = now
             val wasRunning = layer.motion.isRunning(now)
@@ -297,8 +294,7 @@ class HomeDockWindow : BaseHook() {
                 else -> configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
             }
             val windowVisible = window.callMethod("isVisible") == true
-            val autoHide = autoHideState != 0
-            val visible = windowVisible && !autoHide
+            val visible = windowVisible
             bindNativeMotion(layer, visible)
             if (!visible || !animationAvailable) layer.motion.finish()
             val glass = updateGlass(layer, config, bounds, dark, visible)

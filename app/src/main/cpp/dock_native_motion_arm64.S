@@ -165,4 +165,34 @@ dock_motion_scale_entry:
 .endm
 scene_entry dock_motion_anim_entry, dock_motion_anim_original, 0
 scene_entry dock_motion_set_entry, dock_motion_set_original, 1
+
+.global dock_edit_entry
+.hidden dock_edit_entry
+.type dock_edit_entry, %function
+dock_edit_entry:
+    save_state
+    // The dynamically matched EditMode closure receives EditState at the top
+    // of Dart's x15 stack. Enum indices are Dart Smis at tagged offset 7.
+    // save_state moved x15 down by 32 bytes; recover the pre-hook stack top.
+    ldr x10, [x15, #32]
+    tbz x10, #0, .Ledit_done
+    ldur x9, [x10, #7]
+    tbnz x9, #0, .Ledit_done
+    asr x9, x9, #1
+    cmp x9, #7
+    b.hi .Ledit_done
+    add w10, w9, #1
+    adrp x17, dock_edit_state
+    add x17, x17, :lo12:dock_edit_state
+    ldar w11, [x17]
+    cmp w10, w11
+    b.eq .Ledit_done
+    stlr w10, [x17]
+    notify
+.Ledit_done:
+    restore_state
+    adrp x16, dock_edit_original
+    ldr x16, [x16, :lo12:dock_edit_original]
+    br x16
+.size dock_edit_entry, .-dock_edit_entry
 .section .note.GNU-stack,"",%progbits

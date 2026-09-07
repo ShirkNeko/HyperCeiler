@@ -1,53 +1,127 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 #include <android/log.h>
+#include <android/binder_ibinder.h>
+#include <android/binder_parcel.h>
+#include <android/binder_status.h>
 #include <atomic>
-#include <bit>
 #include <cerrno>
-#include <cstddef>
 #include <cstdint>
-#include <cstdio>
+#include <cstring>
+#include <dlfcn.h>
 #include <poll.h>
 #include <sys/eventfd.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <time.h>
-#include <unistd.h>
 
 extern "C" {
 // Low two bits carry scene: 0=unrelated, 1=recents, 2=home return.
 // Removing two mantissa bits loses < 1e-15, well below a physical pixel.
 alignas(8) std::atomic<uint64_t> dock_motion_value{0x3ff0000000000000ULL};
+// 0=unknown; otherwise EditState enum index + 1 (indices 0..7).
+alignas(4) std::atomic<uint32_t> dock_edit_state{0};
 alignas(4) std::atomic<uint32_t> dock_motion_subscribed{0};
 int dock_motion_event = -1;
 extern const uint64_t dock_motion_one = 1;
 void *dock_motion_scale_original = nullptr;
 void *dock_motion_anim_original = nullptr;
 void *dock_motion_set_original = nullptr;
+void *dock_edit_original = nullptr;
 }
 static_assert(std::atomic<uint64_t>::is_always_lock_free && sizeof(std::atomic<uint64_t>) == 8);
 static_assert(std::atomic<uint32_t>::is_always_lock_free && sizeof(std::atomic<uint32_t>) == 4);
 
 namespace {
 constexpr char kTag[] = "HyperCeiler.DockNative";
-struct Packet {
-    uint32_t magic = 0x48434437;
-    uint32_t version = 1;
+constexpr transaction_code_t kMotionTransaction = 0x00484344;
+constexpr char kWindowDescriptor[] = "android.view.IWindowManager";
+std::atomic<uint64_t> motion_sequence{0};
+
+void retry_delay() {
+    timespec delay{0, 500000000};
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+}
+
+struct Sample {
     uint64_t sequence;
     uint64_t uptime_ns;
     uint64_t value;
+    uint64_t edit_state;
 };
-static_assert(sizeof(Packet) == 32 && std::endian::native == std::endian::little);
 
-bool send_sample(int client, uint64_t &sequence) {
+bool current_sample(Sample &sample) {
     timespec now{};
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return false;
-    Packet packet{0x48434437, 1, ++sequence,
-        static_cast<uint64_t>(now.tv_sec) * 1000000000ULL + now.tv_nsec,
-        dock_motion_value.load(std::memory_order_acquire)};
-    // Never block either worker or render thread on WMS. A short write closes
-    // the connection; the receiver never decodes a partially spliced packet.
-    return send(client, &packet, sizeof(packet), MSG_DONTWAIT | MSG_NOSIGNAL) == sizeof(packet);
+    sample.sequence = motion_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    sample.uptime_ns = static_cast<uint64_t>(now.tv_sec) * 1000000000ULL + now.tv_nsec;
+    sample.value = dock_motion_value.load(std::memory_order_acquire);
+    sample.edit_state = dock_edit_state.load(std::memory_order_acquire);
+    return true;
 }
+
+void *binder_on_create(void *) {
+    return nullptr;
+}
+
+void binder_on_destroy(void *) {}
+
+binder_status_t binder_on_transact(AIBinder *, transaction_code_t,
+    const AParcel *, AParcel *) {
+    return STATUS_UNKNOWN_TRANSACTION;
+}
+
+const AIBinder_Class *window_manager_class() {
+    static AIBinder_Class *clazz = AIBinder_Class_define(kWindowDescriptor,
+        binder_on_create, binder_on_destroy, binder_on_transact);
+    return clazz;
+}
+
+class WindowBinderTransport {
+public:
+    ~WindowBinderTransport() {
+        if (window_ != nullptr) AIBinder_decStrong(window_);
+    }
+
+    bool connect() {
+        // Service-manager lookup is a platform extension omitted from the app
+        // NDK headers, but exported by the same libbinder_ndk already used by
+        // the OS4 launcher. Resolve the symbol, never a library/address offset.
+        using GetService = AIBinder *(*)(const char *instance);
+        const auto get_service = reinterpret_cast<GetService>(
+            dlsym(RTLD_DEFAULT, "AServiceManager_getService"));
+        if (get_service == nullptr) return false;
+        window_ = get_service("window");
+        if (window_ == nullptr) return false;
+
+        const AIBinder_Class *clazz = AIBinder_getClass(window_);
+        if (clazz != nullptr) {
+            const char *descriptor = AIBinder_Class_getDescriptor(clazz);
+            return descriptor != nullptr && std::strcmp(descriptor, kWindowDescriptor) == 0;
+        }
+        clazz = window_manager_class();
+        return clazz != nullptr && AIBinder_associateClass(window_, clazz);
+    }
+
+    bool send(const Sample &sample) {
+        AParcel *input = nullptr;
+        if (AIBinder_prepareTransaction(window_, &input) != STATUS_OK || input == nullptr) {
+            return false;
+        }
+        if (AParcel_writeInt64(input, static_cast<int64_t>(sample.sequence)) != STATUS_OK
+            || AParcel_writeInt64(input, static_cast<int64_t>(sample.uptime_ns)) != STATUS_OK
+            || AParcel_writeInt64(input, static_cast<int64_t>(sample.value)) != STATUS_OK
+            || AParcel_writeInt64(input, static_cast<int64_t>(sample.edit_state)) != STATUS_OK) {
+            AParcel_delete(input);
+            return false;
+        }
+        AParcel *output = nullptr;
+        const binder_status_t status = AIBinder_transact(window_, kMotionTransaction,
+            &input, &output, 0);
+        if (output != nullptr) AParcel_delete(output);
+        return status == STATUS_OK;
+    }
+
+private:
+    AIBinder *window_ = nullptr;
+};
 } // namespace
 
 bool prepare_dock_motion() {
@@ -56,64 +130,52 @@ bool prepare_dock_motion() {
 }
 
 void run_dock_motion() {
-    const int server = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-    if (server < 0) return;
-    sockaddr_un address{};
-    address.sun_family = AF_UNIX;
-    const int length = snprintf(address.sun_path + 1, sizeof(address.sun_path) - 1,
-        "hyperceiler.dock.motion.%d", getpid());
-    if (length <= 0 || static_cast<size_t>(length) >= sizeof(address.sun_path) - 1
-        || bind(server, reinterpret_cast<sockaddr *>(&address),
-            offsetof(sockaddr_un, sun_path) + 1 + length) != 0 || listen(server, 2) != 0) {
-        __android_log_print(ANDROID_LOG_WARN, kTag, "motion socket unavailable errno=%d", errno);
-        close(server);
-        return;
-    }
-    __android_log_print(ANDROID_LOG_INFO, kTag, "motion v8 ready: dynamically resolved; event-driven native scale");
-    int client = -1;
-    uint64_t sequence = 0;
-    unsigned connections = 0;
-    auto disconnect = [&] {
-        dock_motion_subscribed.store(0, std::memory_order_release);
-        if (client >= 0) close(client);
-        client = -1;
-    };
+    const int event = dock_motion_event;
+    if (event < 0) return;
+    unsigned reconnects = 0;
+    bool unavailable_reported = false;
     for (;;) {
-        pollfd descriptors[] = {{server, POLLIN, 0}, {dock_motion_event, POLLIN, 0},
-            {client, POLLIN, 0}};
-        if (poll(descriptors, 3, -1) < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        // No input protocol: unexpected input, EOF or a dead peer closes the stream.
-        if (client >= 0 && descriptors[2].revents != 0) disconnect();
-        if (descriptors[0].revents & POLLIN) {
-            int incoming = accept4(server, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
-            if (incoming >= 0) {
-                ucred credentials{};
-                socklen_t size = sizeof(credentials);
-                if (getsockopt(incoming, SOL_SOCKET, SO_PEERCRED, &credentials, &size) != 0
-                    || size != sizeof(credentials) || credentials.uid != 1000 || client >= 0) {
-                    close(incoming);
-                } else {
-                    client = incoming;
-                    const int buffer_bytes = 2048;
-                    setsockopt(client, SOL_SOCKET, SO_SNDBUF, &buffer_bytes, sizeof(buffer_bytes));
-                    dock_motion_subscribed.store(1, std::memory_order_release);
-                    if (!send_sample(client, sequence)) disconnect();
-                    else if (connections++ < 12) __android_log_print(ANDROID_LOG_INFO, kTag,
-                        "motion subscriber connected pid=%d", credentials.pid);
-                }
+        WindowBinderTransport transport;
+        Sample sample{};
+        if (!transport.connect() || !current_sample(sample) || !transport.send(sample)) {
+            dock_motion_subscribed.store(0, std::memory_order_release);
+            if (!unavailable_reported) {
+                __android_log_print(ANDROID_LOG_WARN, kTag,
+                    "motion Binder transport unavailable; retrying in background");
+                unavailable_reported = true;
             }
+            retry_delay();
+            continue;
         }
-        if (descriptors[1].revents & POLLIN) {
+
+        unavailable_reported = false;
+        dock_motion_subscribed.store(1, std::memory_order_release);
+        __android_log_print(ANDROID_LOG_INFO, kTag,
+            "motion v19 ready: native scale/edit over authenticated IWindowManager Binder reconnect=%u",
+            reconnects);
+
+        bool disconnected = false;
+        while (!disconnected) {
+            pollfd descriptor{event, POLLIN, 0};
+            int result;
+            do {
+                result = poll(&descriptor, 1, -1);
+            } while (result < 0 && errno == EINTR);
+            if (result <= 0 || !(descriptor.revents & POLLIN)) {
+                disconnected = true;
+                continue;
+            }
             eventfd_t count = 0;
-            if (eventfd_read(dock_motion_event, &count) == 0 && client >= 0
-                && !send_sample(client, sequence)) disconnect();
+            disconnected = eventfd_read(event, &count) != 0
+                || !current_sample(sample) || !transport.send(sample);
         }
+
+        dock_motion_subscribed.store(0, std::memory_order_release);
+        if (reconnects < 3) {
+            __android_log_print(ANDROID_LOG_WARN, kTag,
+                "motion Binder transport disconnected; reconnecting");
+        }
+        ++reconnects;
+        retry_delay();
     }
-    disconnect();
-    close(server);
-    // The event FD remains allocated until process exit: a callback may have
-    // already read it. Never recycle its number into an unrelated descriptor.
 }

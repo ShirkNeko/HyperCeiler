@@ -1,41 +1,47 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 package com.sevtinge.hyperceiler.libhook.rules.home.dock;
 
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-
-/** Pure packet/scene policy. No Android dependencies and no log-derived animation. */
+/** Pure Binder-sample/scene policy. No Android dependencies and no log-derived animation. */
 public final class DockNativeMotion {
-    public static final int PACKET_SIZE = 32;
     public static final long MAX_AGE_NS = 150_000_000L;
     private long sequence;
     private boolean recents;
     private float progress;
-    public record Sample(long sequence, long uptimeNanos, int scene, double scale) { }
+    public record Sample(long sequence, long uptimeNanos, int scene, double scale,
+                         int editState) {
+        /** null until native EditMode has published its first state. */
+        public Boolean editHidden() {
+            return switch (editState) {
+                case 0 -> null;
+                // Encoded enum indices: disabled=1, normal=2, shortcutMenu=7.
+                case 1, 2 -> false;
+                // quick, multiselect, pinchingIn/out and preview are editing UI.
+                case 3, 4, 5, 6, 8 -> true;
+                default -> null;
+            };
+        }
+    }
 
-    public static Sample decode(byte[] bytes, long previousSequence, long nowNanos) {
-        if (bytes == null || bytes.length != PACKET_SIZE) return null;
-        ByteBuffer buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
-        if (buffer.getInt() != 0x48434437 || buffer.getInt() != 1) return null;
-        long sequence = buffer.getLong();
-        long timestamp = buffer.getLong();
-        long packed = buffer.getLong();
+    public static Sample validate(long sequence, long timestamp, long packed, long editState,
+                                  long previousSequence, long nowNanos) {
         int scene = (int) (packed & 3);
         double scale = Double.longBitsToDouble(packed & ~3L);
         if (sequence <= previousSequence || timestamp < 0 || timestamp > nowNanos
                 || nowNanos - timestamp > MAX_AGE_NS || scene > 2
-                || !Double.isFinite(scale) || scale < 0 || scale > 2) return null;
-        return new Sample(sequence, timestamp, scene, scale);
+                || !Double.isFinite(scale) || scale < 0 || scale > 2
+                || editState < 0 || editState > 8) return null;
+        return new Sample(sequence, timestamp, scene, scale, (int) editState);
     }
 
     public boolean accept(Sample sample) {
         if (sample == null || sample.sequence() <= sequence) return false;
         sequence = sample.sequence();
         if (sample.scene() == 1) recents = true;
-        else if (sample.scene() == 0) recents = false;
-        // Other scenes may legitimately use much smaller scales. Do not tear
-        // down their transport, but never turn them into a recents lift.
-        if (sample.scale() < .90 || sample.scale() > 1.10) recents = false;
+        else if (sample.scene() == 0 && (!recents || sample.scale() >= .999999)) recents = false;
+        // OS4 briefly publishes scene 0 while an already-authenticated recents
+        // drag is still below scale 1, then resumes scene 1. Preserve that latch
+        // instead of snapping to the default position. Scene 0 can never start
+        // a lift by itself, and scale 1 still terminates it.
         // A folder/app returning to scale 1 cannot start a recents animation.
         progress = recents ? (float) Math.max(0, Math.min(1.2, (1 - sample.scale()) / 0.05)) : 0;
         if (sample.scene() == 2 && Math.abs(sample.scale() - 1) < 0.000001) {

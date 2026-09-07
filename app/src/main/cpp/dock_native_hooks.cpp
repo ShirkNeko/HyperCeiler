@@ -20,9 +20,11 @@ dock_motion::Layout dock_motion_layout{};
 void dock_motion_scale_entry();
 void dock_motion_anim_entry();
 void dock_motion_set_entry();
+void dock_edit_entry();
 extern void *dock_motion_scale_original;
 extern void *dock_motion_anim_original;
 extern void *dock_motion_set_original;
+extern void *dock_edit_original;
 }
 
 namespace {
@@ -106,11 +108,14 @@ void *motion_worker(void *) {
         || hook_function(reinterpret_cast<void *>(resolved.set),
             reinterpret_cast<void *>(dock_motion_set_entry), &dock_motion_set_original) != 0
         || hook_function(reinterpret_cast<void *>(resolved.scale),
-            reinterpret_cast<void *>(dock_motion_scale_entry), &dock_motion_scale_original) != 0) {
+            reinterpret_cast<void *>(dock_motion_scale_entry), &dock_motion_scale_original) != 0
+        || hook_function(reinterpret_cast<void *>(resolved.edit),
+            reinterpret_cast<void *>(dock_edit_entry), &dock_edit_original) != 0) {
         __android_log_print(ANDROID_LOG_WARN, kTag, "motion hooks unavailable; no subscription enabled");
         return nullptr;
     }
-    __android_log_print(ANDROID_LOG_INFO, kTag, "dynamic motion v11 resolved: paramsCID=%u doubleCID=%u",
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+        "dynamic motion v19 resolved: paramsCID=%u doubleCID=%u edit=dynamic",
         resolved.layout.params_class_id, resolved.layout.double_class_id);
     run_dock_motion();
     return nullptr;

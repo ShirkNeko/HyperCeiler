@@ -37,6 +37,7 @@ struct Resolution {
     uintptr_t scale;
     uintptr_t animate;
     uintptr_t set;
+    uintptr_t edit;
     Layout layout;
 };
 
@@ -69,6 +70,11 @@ inline constexpr Shape kParamsShape{199, 0xd711731a2821d813ULL,
     {0xa9bf79fd, 0xaa0f03fd, 0xd10001ef, 0xaa1603e1}};
 inline constexpr Shape kFactoryShape{21, 0x91e4c216ebc79c09ULL,
     {0x94000000, 0xf800001f, 0x91400371, 0xfd400220}};
+// EditMode's state-change closure. The callback takes the EditState enum at
+// the top of Dart's x15 stack. Its normalized structure is identical and
+// unique in the reviewed launcher 6179 and 6236 artifacts.
+inline constexpr Shape kEditShape{28, 0xa49ee9840058b944ULL,
+    {0xa9bf79fd, 0xaa0f03fd, 0xd10001ef, 0xf94003a0}};
 
 struct Match {
     uintptr_t address;
@@ -135,7 +141,9 @@ inline std::optional<Resolution> resolve(std::span<const CodeRange> ranges) {
     const auto immediate = find(ranges, kSetShape);
     const auto params = find(ranges, kParamsShape);
     const auto factory = find(ranges, kFactoryShape);
-    if (anim.size() != 1 || immediate.size() != 1 || params.size() != 1 || factory.size() != 1) return {};
+    const auto edit = find(ranges, kEditShape);
+    if (anim.size() != 1 || immediate.size() != 1 || params.size() != 1
+        || factory.size() != 1 || edit.size() != 1) return {};
     const auto allocation = call_target(factory[0], 0);
     if (!allocation) return {};
     const auto stub = at(ranges, *allocation, 3);
@@ -177,7 +185,7 @@ inline std::optional<Resolution> resolve(std::span<const CodeRange> ranges) {
     const auto params_id = (*params_tag >> kClassIdShift) & kClassIdMask;
     const auto double_id = (*double_tag >> kClassIdShift) & kClassIdMask;
     if (params_id == 0 || double_id == 0 || params_id == double_id) return {};
-    return Resolution{scale_match->address, anim[0].address, immediate[0].address,
+    return Resolution{scale_match->address, anim[0].address, immediate[0].address, edit[0].address,
         {params_id, double_id, static_cast<uint32_t>(alpha), static_cast<uint32_t>(scale),
         static_cast<uint32_t>(surface), static_cast<uint32_t>(recents), static_cast<uint32_t>(double_value)}};
 }

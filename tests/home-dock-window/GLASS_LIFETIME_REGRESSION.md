@@ -44,17 +44,30 @@ returned `BR_FROZEN_REPLY`; ActivityManager recorded `unstable content provider`
 exits. Several such exits preceded the deliberate force-stop and also existed
 in the pre-fix history. The retry budget could become exhausted.
 
-Hook diagnostic version 10 additionally binds a private, direct-boot-aware
-HyperCeiler service for each glass generation, using the normal Android service
-dependency rather than a stable provider dependency or a system-wide freezer
-exemption. Disposal unbinds the service. The service is not exported and is not
-a started/foreground service. No global policy or battery setting is changed.
+Hook diagnostic version 14 replaces the ineffective service-binding experiment.
+OS4 explicitly ignores system-server dependencies when freezing background
+apps. The active generation now owns an in-memory freeze guard for the verified
+HyperCeiler UID/current PID, removed before the generation is disposed. It does
+not add a persistent whitelist or change any system/global policy.
 
-The version 10 APK built successfully, passed APK-v2 verification, and was
-installed with data preserved. Hot reload was confirmed. Final on-device
-service/texture verification requires returning to the desktop; no host is
-created while the launcher is invisible. This final check must not be inferred
-from the user's earlier version 9 visual confirmation.
+Version 13 also keeps retrying at a capped cadence after a renderer that previously
+reached native-glass readiness is killed. Unsupported configurations retain the
+bounded startup budget. This prevents a launcher restart from being the only way
+to recover after cumulative runtime deaths. Verification requires returning to
+the desktop; no host is created while the launcher is invisible.
+
+Version 16 distinguishes loss of an already-ready renderer from an initialization
+failure. The former is recreated immediately, removing the fixed two-second gap
+after OS4 OneKeyClean force-stops the HyperCeiler package. If that immediate
+recreation does not become ready, subsequent failures return to the bounded
+2/4/8/16/30-second backoff.
+
+The active lease also contributes the package only to the temporary whitelist
+constructed for OS4 policy-1 OneKeyClean. The check requires the stored renderer
+PID to resolve to its previously verified UID at the instant of cleaning. It does
+not alter a static whitelist and does not intercept direct force-stop, swipe-kill,
+thermal, idle, lock-screen or other cleanup policies. This retains the live glass
+buffer through the recents clear instead of merely shortening its reconstruction.
 
 ## Follow-up verification
 

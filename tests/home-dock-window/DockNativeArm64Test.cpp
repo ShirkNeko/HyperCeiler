@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic ignored "-Wunused-member"
+#endif
 #include <atomic>
 #include <bit>
 #include <cassert>
@@ -16,9 +18,11 @@ extern "C" {
 void dock_motion_scale_entry();
 void dock_motion_anim_entry();
 void dock_motion_set_entry();
+void dock_edit_entry();
 void dock_test_trampoline();
 void dock_test_invoke(void (*)(), void *, uint64_t *);
 alignas(8) std::atomic<uint64_t> dock_motion_value{0x3ff0000000000000ULL};
+alignas(4) std::atomic<uint32_t> dock_edit_state{0};
 alignas(4) std::atomic<uint32_t> dock_motion_subscribed{0};
 int dock_motion_event = -1;
 extern const uint64_t dock_motion_one = 1;
@@ -26,6 +30,7 @@ void *dock_motion_scale_original = reinterpret_cast<void *>(dock_test_trampoline
 dock_motion::Layout dock_motion_layout{};
 void *dock_motion_anim_original = reinterpret_cast<void *>(dock_test_trampoline);
 void *dock_motion_set_original = reinterpret_cast<void *>(dock_test_trampoline);
+void *dock_edit_original = reinterpret_cast<void *>(dock_test_trampoline);
 }
 
 struct alignas(16) Fixture {
@@ -99,6 +104,20 @@ int main() {
         assert(scene() == 0);
         invoke(dock_motion_set_entry, reinterpret_cast<void *>(2)); // Smi must not be dereferenced
         invoke(dock_motion_scale_entry, reinterpret_cast<void *>(2));
+        struct alignas(16) EditState { uint64_t header = 10057ULL << 12; uint64_t index = 4 << 1; } edit;
+        invoke_fixture(dock_edit_entry, edit);
+        assert(dock_edit_state.load() == 5);
+        invoke_fixture(dock_edit_entry, edit); // unchanged state must not notify again.
+        edit.index = 1 << 1;
+        invoke_fixture(dock_edit_entry, edit);
+        assert(dock_edit_state.load() == 2);
+        edit.index = 8 << 1;
+        invoke_fixture(dock_edit_entry, edit);
+        assert(dock_edit_state.load() == 2); // Unknown future enum values fail closed.
+        edit.index = (7ULL << 1) | 1;
+        invoke_fixture(dock_edit_entry, edit);
+        assert(dock_edit_state.load() == 2); // Index must remain a Dart Smi.
+        invoke(dock_edit_entry, reinterpret_cast<void *>(2));
         eventfd_t notifications = 0;
         const auto received = eventfd_read(dock_motion_event, &notifications);
         if (subscribed) assert(received == 0 && notifications > 0);

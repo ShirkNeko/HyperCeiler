@@ -17,14 +17,18 @@ public final class DockGlassProcessPolicyTest {
         check(policy.filter(batch, false, null) == batch);
         policy.acquire(first, 10371);
         policy.acquire(second, 10371);
+        check(!policy.hasLiveOwner(pid -> 10371));
         check(Arrays.equals(policy.filter(batch, false, null), new int[]{1000, 11000}));
         check(batch[1] == 10371); // Caller-owned request array is unchanged.
         check(policy.filter(new int[]{10371}, false, null).length == 0);
         policy.setPid(first, 20001);
+        check(policy.hasLiveOwner(pid -> 10371));
+        check(!policy.hasLiveOwner(pid -> 11000));
         int[] pids = {20001, 20002};
         check(Arrays.equals(policy.filter(pids, true, pid -> 10371), new int[]{20002}));
         check(policy.filter(pids, true, pid -> 11000) == pids); // PID reused by another app.
         policy.release(first);
+        check(!policy.hasLiveOwner(pid -> 10371));
         check(policy.filter(pids, true, pid -> 10371) == pids);
         check(policy.filter(batch, false, null).length == 2); // Resize handover still owns UID.
         policy.release(second);

@@ -18,4 +18,4 @@ target_compile_options(hyperceiler_home PRIVATE
     -fvisibility=hidden
 )
 
-target_link_libraries(hyperceiler_home PRIVATE android log)
+target_link_libraries(hyperceiler_home PRIVATE android binder_ndk log)

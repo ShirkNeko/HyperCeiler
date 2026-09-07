@@ -32,6 +32,8 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
         var lifetime: IBinder? = null
         var death: IBinder.DeathRecipient? = null
         var attempts = 0
+        var previouslyReady = false
+        var consecutiveFailures = 0
         var recoveryPending = false
         var client: ContentProviderClient? = null
 
@@ -191,6 +193,8 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
                 status.getString("error")?.let { error(it) }
                 ticket.ready = ticket.lease?.isAttached == true && status.getBoolean("backgroundReady")
                 if (ticket.ready) {
+                    ticket.previouslyReady = true
+                    ticket.consecutiveFailures = 0
                     record("glass ready id=${ticket.id} attempt=${ticket.attempts} check=${attempt + 1}")
                     changed()
                 } else if (attempt + 1 < DockGlassRetryPolicy.BACKGROUND_CHECKS) {
@@ -219,11 +223,15 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
 
     private fun recover(ticket: Ticket, reason: String) {
         if (ticket.cancelled || closed || ticket.recoveryPending) return
+        val wasReady = ticket.ready
         ticket.recoveryPending = true
         ticket.dead = true
         ticket.ready = false
         dispose(ticket)
-        val delay = DockGlassRetryPolicy.delayAfterFailure(ticket.attempts)
+        if (!wasReady) ticket.consecutiveFailures++
+        val delay = DockGlassRetryPolicy.delayAfterRuntimeFailure(
+            ticket.consecutiveFailures, wasReady, ticket.previouslyReady
+        )
         record("glass failed id=${ticket.id} attempt=${ticket.attempts} reason=$reason retryMs=$delay")
         changed()
         if (delay >= 0) worker.postDelayed({ attemptCreate(ticket) }, delay)

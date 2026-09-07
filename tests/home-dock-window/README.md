@@ -1,7 +1,8 @@
 # HyperOS 4 Dock window regression checks
 
-Current native implementation: [v8 dynamic resolution and verification](NATIVE_DYNAMIC_RESOLUTION.md).
-Java hook diagnostic version 10 additionally fixes remote glass surface lifetime:
+Current native implementation: [v18 dynamic resolution, verification, and Binder reconnect](NATIVE_DYNAMIC_RESOLUTION.md).
+Java hook diagnostic version 16 additionally fixes remote glass surface lifetime and
+immediate recovery after a live renderer is force-stopped:
 attach and detach are serialized on the IPC worker, never deferred in WMS's sync
 transaction. Each generation is explicitly reparented to null before releasing
 its SurfacePackage. Late attachment requests are rejected after retirement; a
@@ -11,12 +12,17 @@ can clean it up. Parent visibility and recents motion remain WMS-controlled.
 partial attachment, failed-detach retry, cancellation and idempotent release.
 Device verification must additionally check that repeated renderer recovery does
 not accumulate old SurfaceControlViewHost / Dock glass layers in SurfaceFlinger.
-The renderer also has a private, direct-boot-aware bound service. An unstable
-provider reference alone allowed OS4 to freeze the rendering process, returning
-BR_FROZEN_REPLY and triggering provider-death recovery. The system hook binds
-only HyperCeiler's service for each glass generation and unbinds on disposal;
-no started/foreground service, freezer exemption or global setting is used.
-Verify this dependency disappears on Dock removal, mode change and hot reload.
+An unstable provider reference and a system-server service binding both allow
+OS4 to freeze the rendering process, returning BR_FROZEN_REPLY and triggering
+provider-death recovery. While at least one verified HyperCeiler glass lease is
+active, the hook filters only HyperCeiler's exact UID/current PID out of OS4
+Greeze freeze batches. The same live-PID verification adds HyperCeiler only to
+the per-request whitelist of OS4 policy-1 OneKeyClean, so clearing recents cannot
+destroy an active native-glass buffer. Direct force-stop and every other clean
+policy remain untouched. It first verifies exclusive package ownership and checks
+PID-to-UID identity to prevent PID reuse. The lease is removed on disposal,
+mode change and hot reload; other UIDs are never altered and no persistent
+whitelist, global setting, started service or foreground service is created.
 The probe/v7 sections below are historical investigation notes; their address
 profiles and opt-in probe have been removed and are not used by current builds.
 
@@ -46,6 +52,7 @@ javac -d "$dock_test_dir" \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockRecentsMotion.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassRetryPolicy.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassSurfaceLease.java \
+  library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassProcessPolicy.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockWallpaperEndpoint.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockNativeMotion.java \
   tests/home-dock-window/DockWindowPolicyTest.java \
@@ -53,10 +60,10 @@ javac -d "$dock_test_dir" \
   tests/home-dock-window/DockRecentsMotionTest.java \
   tests/home-dock-window/DockGlassRetryPolicyTest.java \
   tests/home-dock-window/DockGlassSurfaceLeaseTest.java \
+  tests/home-dock-window/DockGlassProcessPolicyTest.java \
   tests/home-dock-window/DockWallpaperEndpointTest.java \
   tests/home-dock-window/DockNativeMotionTest.java
-  
-for test in DockWindowPolicy DockGlassPreset DockRecentsMotion DockGlassRetryPolicy DockGlassSurfaceLease DockWallpaperEndpoint DockNativeMotion; do
+for test in DockWindowPolicy DockGlassPreset DockRecentsMotion DockGlassRetryPolicy DockGlassSurfaceLease DockGlassProcessPolicy DockWallpaperEndpoint DockNativeMotion; do
   java -cp "$dock_test_dir" "com.sevtinge.hyperceiler.tests.dock.${test}Test"
 done
 ```
@@ -87,10 +94,12 @@ parents only the returned HyperCeiler surface, underneath the launcher buffer.
 The original compositor blur is retained until the host commits a frame **and**
 reports a nonzero vendor background-texture timestamp. Unsupported APIs,
 rejected pass-window background, missing textures, and renderer death fall back
-to compositor blur. Each ticket now allows six creation attempts, with delayed
-retries of 2, 4, 8, 16 and 30 seconds. Each attempt checks the vendor texture up
-to twenty times at 500ms intervals. Successful readiness stops polling; exhausted
-recovery retains the fallback. Disabling/removal cancels the ticket, stale
+to compositor blur. An unsupported ticket uses delayed retries of 2, 4, 8, 16
+and 30 seconds. Once a ticket has successfully rendered native glass, the first
+loss of its live renderer is recreated immediately; only a failed recreation
+resumes the bounded backoff, capped at 30 seconds. Each attempt checks the vendor texture up to
+twenty times at 500ms intervals. Successful readiness stops polling. Disabling
+or removal cancels the ticket, stale
 generation callbacks cannot affect a newer attempt, and hot reload stops the
 worker. Retries never run on the WMS thread or at frame rate.
 

@@ -2,8 +2,10 @@
 package com.sevtinge.hyperceiler.libhook.rules.home.dock
 
 import android.content.Context
+import android.util.Log
 import io.github.lingqiqi5211.ezhooktool.core.loadClass
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.createBeforeHook
+import java.util.ArrayList
 
 /** Protect only verified HyperCeiler render leases, never another application's UID. */
 internal class DockGlassProcessGuard {
@@ -35,6 +37,28 @@ internal class DockGlassProcessGuard {
                 }
             }
         }
+        val processConfig = loadClass("miui.process.ProcessConfig")
+        val getPolicy = processConfig.getDeclaredMethod("getPolicy").apply { isAccessible = true }
+        val getWhiteList = processConfig.getDeclaredMethod("getWhiteList").apply { isAccessible = true }
+        val setWhiteList = processConfig.getDeclaredMethod("setWhiteList", List::class.java)
+            .apply { isAccessible = true }
+        val oneKeyClean = loadClass("com.android.server.am.ProcessSceneCleaner")
+            .getDeclaredMethod("handleKillAll", processConfig).apply { isAccessible = true }
+        oneKeyClean.createBeforeHook { param ->
+            val config = param.args[0] ?: return@createBeforeHook
+            if (closed || getPolicy.invoke(config) != 1 ||
+                !policy.hasLiveOwner { pid ->
+                    runCatching { pidUid.invoke(null, pid) as Int }.getOrDefault(-1)
+                }) return@createBeforeHook
+
+            val existing = getWhiteList.invoke(config) as? List<*>
+            if (existing?.contains(PACKAGE_NAME) == true) return@createBeforeHook
+            val protected = ArrayList<String>(existing?.size?.plus(1) ?: 1)
+            existing?.filterIsInstanceTo(protected)
+            protected.add(PACKAGE_NAME)
+            setWhiteList.invoke(config, protected)
+            Log.i("HyperCeiler.DockGlass", "OneKeyClean protected active renderer lease")
+        }
         serviceClass = clazz
     }
 
@@ -42,11 +66,12 @@ internal class DockGlassProcessGuard {
     fun acquire(context: Context, token: Any) {
         check(!closed) { "Renderer guard closed" }
         val clazz = checkNotNull(serviceClass) { "OS4 renderer lifecycle API unavailable" }
-        val pkg = "com.sevtinge.hyperceiler"
+        val pkg = PACKAGE_NAME
         val uid = context.packageManager.getApplicationInfo(pkg, 0).uid
         val packages = context.packageManager.getPackagesForUid(uid)
         check(packages?.size == 1 && packages[0] == pkg) { "Renderer UID ownership is ambiguous" }
         policy.acquire(token, uid)
+        var ready = false
         try {
             val service = clazz.getDeclaredMethod("getService").invoke(null)
                 ?: error("OS4 freezer service unavailable")
@@ -61,13 +86,18 @@ internal class DockGlassProcessGuard {
                     "Renderer could not be thawed"
                 }
             }
-        } catch (error: ReflectiveOperationException) {
-            policy.release(token)
-            throw error
+            ready = true
+        } finally {
+            // No failed/partial acquisition may leave an unowned freezer exemption.
+            if (!ready) policy.release(token)
         }
     }
 
     fun setPid(token: Any, pid: Int) { policy.setPid(token, pid) }
     fun release(token: Any) { policy.release(token) }
     fun close() { closed = true; policy.clear() }
+
+    private companion object {
+        const val PACKAGE_NAME = "com.sevtinge.hyperceiler"
+    }
 }

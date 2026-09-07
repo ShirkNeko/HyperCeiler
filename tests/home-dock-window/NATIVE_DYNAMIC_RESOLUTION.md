@@ -1,4 +1,4 @@
-# OS4 native motion v8: dynamic resolution
+# OS4 native motion v18: dynamic resolution and reconnect
 
 The production observer no longer has a launcher Build ID/address table, fixed
 class IDs, or fixed launcher payload offsets. The old probe and profile-only
@@ -7,7 +7,10 @@ tests were removed (recoverable from Git history).
 ## Resolution and safety boundary
 
 1. Find `libapp.so` with `dl_iterate_phdr`, accepting only bounded, readable and
-   executable PT_LOAD ranges. Do not inspect other apps, writable heaps or data.
+   executable PT_LOAD ranges. HYOS can map AOT code outside the linker's image
+   list, so a bounded fallback reads only this process's explicit executable
+   `/libapp.so` mappings from `/proc/self/maps`. It never scans writable,
+   anonymous, heap, or another process's memory.
 2. Match reviewed ARM64 instruction shapes after masking branch displacements,
    pool/field operands and materialized immediates. These are compiler shapes,
    not offsets from a library base. Unknown shapes remain unsupported.
@@ -27,8 +30,35 @@ checked using `offsetof` assertions. A different Dart ABI/compiler shape needs
 review, not speculative memory reads. Structure fingerprints are locators,
 not cryptographic authenticity checks.
 
-Failure retains the existing wallpaper-command animation fallback. Native IPC,
-scene filtering, latest-sample policy and the glass rendering preset are unchanged.
+Failure retains the existing wallpaper-command animation fallback. A scene-0 sample
+cannot initiate motion, but OS4's transient scene-0 samples no longer clear an
+already authenticated recents drag while its scale remains below 1. The latch is
+cleared at the home endpoint or by the return scene. Latest-sample policy and the
+glass rendering preset are unchanged.
+
+LSPosed initializes the module's native entry in `/system_ext/bin/hyos_spawner`
+(currently named `usap64`) before it forks MiuiHome. Version 17 hooks the spawner's
+dynamic `setprogname` symbol; the inherited hook starts the worker only after a
+child identifies itself exactly as `com.miui.home`. The loader callback and
+property-read detection remain bounded fallback signals. HYOS maps its AOT
+application outside the ordinary linker callback path, so the worker still waits
+for and resolves only that process's executable `libapp.so` ranges.
+
+Samples travel from a detached MiuiHome transport worker to system_server as custom
+transactions on the launcher's existing `IWindowManager` Binder. Synchronous Binder
+identity is required because this OS4 kernel reports PID 0 for one-way calls; the
+launcher render callback only publishes to eventfd and never waits on Binder. WMS accepts the fixed-size payload
+only from the UID/PID bound to the exact launcher window Session, validates sequence,
+monotonic timestamp, age, scene and scale, then applies the latest value on the SF
+frame clock. The previous system_server-to-launcher Unix socket was blocked by
+SELinux and has been removed.
+
+The detached sender recreates its `IWindowManager` handle and retries every 500ms
+after a transaction failure. This covers the temporary endpoint loss caused by a
+module install/hot reload without polling while connected or touching the launcher
+render thread. Only the first unavailable interval and first three disconnects are
+logged; each successful connection immediately publishes the latest sample before
+waiting on eventfd again.
 
 ## Verification (2026-09-05)
 
@@ -37,7 +67,7 @@ scene filtering, latest-sample policy and the glass rendering preset are unchang
 - Tests relocate executable ranges, mutate the parameter CID and all four
   relevant field offsets, reject inconsistent accessors, duplicate matches,
   missing callbacks and empty input.
-- Six Java policy tests pass, including packets, replay, fallback continuity,
+- Eight Java policy tests pass, including packets, replay, fallback continuity,
   background-mode migration, glass presets and endpoint ownership.
 - The production assembly was cross-compiled and executed on the connected
   phone using HyperCeiler-only synthetic fixtures. Registers x0-x15, NZCV,

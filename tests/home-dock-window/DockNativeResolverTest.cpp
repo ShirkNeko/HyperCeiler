@@ -1,5 +1,3 @@
-* SPDX-License-Identifier: AGPL-3.0-or-later *
-#pragma GCC diagnostic ignored "-Wunused-member"
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 #include "../../app/src/main/cpp/dock_native_resolver.h"
 #include <cassert>
@@ -43,13 +41,15 @@ int main(int argc, char **argv) {
         const auto original = resolve(ranges);
         assert(original);
         std::cout << argv[arg] << " scale=" << std::hex << original->scale
-            << " animate=" << original->animate << " set=" << original->set << std::dec
+            << " animate=" << original->animate << " set=" << original->set
+            << " edit=" << original->edit << std::dec
             << " CID=" << original->layout.params_class_id << '\n';
         for (auto &range : ranges) range.address += 0x7123450000ULL;
         const auto relocated = resolve(ranges);
         assert(relocated && relocated->scale == original->scale + 0x7123450000ULL);
         assert(relocated->animate == original->animate + 0x7123450000ULL);
         assert(relocated->set == original->set + 0x7123450000ULL);
+        assert(relocated->edit == original->edit + 0x7123450000ULL);
         // Duplicate identities must fail closed, never select the first match.
         auto duplicate = ranges;
         duplicate.push_back(ranges.front());
@@ -60,6 +60,12 @@ int main(int argc, char **argv) {
         *instruction = 0;
         assert(!resolve(ranges));
         *instruction = saved;
+        const auto edit = at(ranges, relocated->edit, kEditShape.words);
+        auto *edit_instruction = const_cast<uint32_t *>(edit.data());
+        const auto saved_edit = *edit_instruction;
+        *edit_instruction = 0;
+        assert(!resolve(ranges));
+        *edit_instruction = saved_edit;
         const auto factory = find(ranges, kFactoryShape).front();
         const auto params = find(ranges, kParamsShape).front();
         const auto setter = find(ranges, kSetShape).front();

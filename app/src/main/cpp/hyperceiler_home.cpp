@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 #include <jni.h>
 #include <sys/system_properties.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cstdint>
@@ -35,12 +36,18 @@ struct NativeApiEntries {
 
 HookFunction g_hook_function = nullptr;
 std::atomic_bool g_property_hook_installed = false;
+std::atomic_bool g_process_name_hook_installed = false;
 std::atomic_bool g_high_device_level = false;
 std::atomic_bool g_disable_prestart = false;
 std::atomic_bool g_soft_glass = false;
+// 0=not specialized yet, 1=launcher, 2=another app. The spawner's zero state is
+// inherited independently by every child.
+std::atomic_int g_process_kind = 0;
 
 using SystemPropertyGet = int (*)(const char *name, char *value);
 SystemPropertyGet g_original_system_property_get = nullptr;
+using SetProcessName = void (*)(const char *name);
+SetProcessName g_original_setprogname = nullptr;
 
 bool is_launcher_process() {
     char name[128]{};
@@ -49,6 +56,39 @@ bool is_launcher_process() {
     const size_t size = std::fread(name, 1, sizeof(name) - 1, file);
     std::fclose(file);
     return size > 0 && std::string_view(name) == "com.miui.home";
+}
+
+void start_motion_after_specialization() {
+#ifdef HYPERCEILER_DOCK_NATIVE_MOTION
+    if (g_process_kind.load(std::memory_order_acquire) != 0) return;
+    char name[128]{};
+    FILE *file = std::fopen("/proc/self/cmdline", "r");
+    if (file == nullptr) return;
+    const size_t size = std::fread(name, 1, sizeof(name) - 1, file);
+    std::fclose(file);
+    if (size == 0) return;
+    const std::string_view process(name);
+    if (process == "com.miui.home") {
+        g_process_kind.store(1, std::memory_order_release);
+        start_dock_native_motion(g_hook_function);
+    } else if (process != "usap64" && process != "hyos_spawner") {
+        // Avoid a /proc read on every property query in unrelated descendants.
+        g_process_kind.store(2, std::memory_order_release);
+    }
+#endif
+}
+
+bool is_hyos_spawner_process() {
+    char executable[128]{};
+    const ssize_t size = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+    if (size <= 0 || static_cast<size_t>(size) >= sizeof(executable)) return false;
+    executable[size] = '\0';
+    return std::string_view(executable) == "/system_ext/bin/hyos_spawner";
+}
+
+bool is_library(std::string_view path, std::string_view name) {
+    return path == name || (path.size() > name.size()
+        && path.ends_with(name) && path[path.size() - name.size() - 1] == '/');
 }
 
 bool is_prestart_property(std::string_view name) {
@@ -67,6 +107,9 @@ int copy_property_value(char *destination, std::string_view value) {
 }
 
 int hooked_system_property_get(const char *name, char *value) {
+    // HYOS maps its AOT libapp outside the ordinary linker callback path. The
+    // inherited property hook is the earliest reliable post-specialization signal.
+    start_motion_after_specialization();
     if (name != nullptr) {
         const std::string_view property(name);
         if (g_disable_prestart.load(std::memory_order_relaxed) &&
@@ -94,8 +137,41 @@ int hooked_system_property_get(const char *name, char *value) {
         ? g_original_system_property_get(name, value) : 0;
 }
 
+void hooked_setprogname(const char *name) {
+    if (g_original_setprogname != nullptr) g_original_setprogname(name);
+#ifdef HYPERCEILER_DOCK_NATIVE_MOTION
+    // hyos_spawner calls setprogname after fork and before the launcher enters
+    // its native runtime. The hook is inherited by the child, so this is an
+    // exact post-specialization signal and does not depend on a later property
+    // read or on a fixed launcher address.
+    if (name != nullptr && std::string_view(name) == "com.miui.home"
+        && g_process_kind.exchange(1, std::memory_order_acq_rel) != 1) {
+        __android_log_print(ANDROID_LOG_INFO, kLogTag,
+            "launcher child detected after setprogname; starting native motion");
+        start_dock_native_motion(g_hook_function);
+    }
+#endif
+}
+
+void install_process_name_hook() {
+    if (g_hook_function == nullptr ||
+        g_process_name_hook_installed.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    void *target = dlsym(RTLD_DEFAULT, "setprogname");
+    if (target == nullptr ||
+        g_hook_function(target, reinterpret_cast<void *>(hooked_setprogname),
+            reinterpret_cast<void **>(&g_original_setprogname)) != 0) {
+        g_process_name_hook_installed.store(false, std::memory_order_release);
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "failed to hook setprogname");
+        return;
+    }
+    __android_log_print(ANDROID_LOG_INFO, kLogTag,
+        "HyperOS 4 launcher specialization hook installed");
+}
+
 void install_property_hook() {
-    if (!is_launcher_process() || g_hook_function == nullptr ||
+    if (g_hook_function == nullptr ||
         g_property_hook_installed.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
@@ -116,13 +192,20 @@ void install_property_hook() {
 void on_library_loaded(const char *name, void *) {
     if (name == nullptr) return;
     const std::string_view library_name(name);
-    if (library_name.ends_with("/libapp_launcher.so") ||
-        library_name == "libapp_launcher.so") {
+    const bool launcher = is_launcher_process();
+    if ((launcher || is_hyos_spawner_process())
+        && is_library(library_name, "libapp_launcher.so")) {
         install_property_hook();
-#ifdef HYPERCEILER_DOCK_NATIVE_MOTION
-        if (is_launcher_process()) start_dock_native_motion(g_hook_function);
-#endif
     }
+#ifdef HYPERCEILER_DOCK_NATIVE_MOTION
+    // HYOS can map libapp.so outside the normal linker callback path. Any later
+    // library load is enough to identify the specialized launcher; the worker
+    // itself waits for and dynamically resolves libapp.so.
+    if (launcher) {
+        install_property_hook();
+        start_dock_native_motion(g_hook_function);
+    }
+#endif
 }
 
 }  // namespace
@@ -139,15 +222,22 @@ Java_com_sevtinge_hyperceiler_libhook_rules_home_os4_NativeHomeHooks_nativeConfi
 extern "C" [[gnu::visibility("default")]] [[gnu::used]]
 NativeOnModuleLoaded native_init(const NativeApiEntries *entries) {
     if (entries == nullptr || entries->hook_func == nullptr) return nullptr;
-    __android_log_print(ANDROID_LOG_INFO, kLogTag, "native v11 hook API version=%u launcher=%d",
-        entries->version, is_launcher_process());
+    const bool spawner = is_hyos_spawner_process();
+    __android_log_print(ANDROID_LOG_INFO, kLogTag,
+        "native v19 hook API version=%u hyosSpawner=%d launcher=%d",
+        entries->version, spawner, is_launcher_process());
     g_hook_function = entries->hook_func;
     // Install before libapp_launcher/libapp run their static initialization and cache the
     // properties. The load callback remains as a retry path for unusual linker ordering.
-    install_property_hook();
+    if (spawner || is_launcher_process()) install_property_hook();
+    if (spawner) install_process_name_hook();
 #ifdef HYPERCEILER_DOCK_NATIVE_MOTION
+    // In the normal path the spawner does not contain libapp.so. Starting here
+    // would spend the entire retry budget before a launcher child is forked.
     if (is_launcher_process()) start_dock_native_motion(g_hook_function);
 #endif
+    // Retaining the callback is harmless in unrelated scoped processes and is
+    // required when HYOS specializes a process after native_init returned.
     return on_library_loaded;
 }
 

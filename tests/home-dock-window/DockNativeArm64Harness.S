@@ -17,6 +17,8 @@ dock_test_invoke:
     mov x20, x0
     mov x2, x1
     add x15, sp, #256
+    // EditMode closures receive their state argument at the top of Dart's stack.
+    str x1, [x15]
     str x15, [x19, #136]
     mov x22, #1
     movk x22, #0x1000, lsl #16

@@ -3,63 +3,68 @@ package com.sevtinge.hyperceiler.tests.dock;
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 import com.sevtinge.hyperceiler.libhook.rules.home.dock.DockNativeMotion;
 import com.sevtinge.hyperceiler.libhook.rules.home.dock.DockRecentsMotion;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 
 public class DockNativeMotionTest {
-    private static byte[] packet(long sequence, long time, int scene, double scale) {
-        return ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN)
-            .putInt(0x48434437).putInt(1).putLong(sequence).putLong(time)
-            .putLong((Double.doubleToRawLongBits(scale) & ~3L) | scene).array();
+    private static DockNativeMotion.Sample sample(long sequence, long time, int scene, double scale, int editState,
+                                                   long previousSequence, long now) {
+        long packed = (Double.doubleToRawLongBits(scale) & ~3L) | scene;
+        return DockNativeMotion.validate(sequence, time, packed, editState, previousSequence, now);
+    }
+    private static DockNativeMotion.Sample sample(long sequence, long time, int scene, double scale,
+                                                   long previousSequence, long now) {
+        return sample(sequence, time, scene, scale, 0, previousSequence, now);
     }
     private static void check(boolean value) { if (!value) throw new AssertionError(); }
     private static void near(float actual, float expected) { check(Math.abs(actual - expected) < 0.001); }
     public static void main(String[] args) {
         long now = 1_000_000_000L;
-        check(DockNativeMotion.decode(null, 0, now) == null);
-        check(DockNativeMotion.decode(new byte[31], 0, now) == null);
-        byte[] data = packet(1, now, 1, .99);
-        check(DockNativeMotion.decode(data, 0, now) != null);
-        check(DockNativeMotion.decode(data, 1, now) == null);
-        check(DockNativeMotion.decode(data, 0, now - 1) == null);
-        check(DockNativeMotion.decode(data, 0, now + DockNativeMotion.MAX_AGE_NS + 1) == null);
-        data[0] ^= 1;
-        check(DockNativeMotion.decode(data, 0, now) == null);
-        data = packet(1, now, 1, .99);
-        data[4] = 2;
-        check(DockNativeMotion.decode(data, 0, now) == null);
+        check(sample(1, now, 1, .99, 0, now) != null);
+        check(sample(1, now, 1, .99, 1, now) == null);
+        check(sample(1, now, 1, .99, 0, now - 1) == null);
+        check(sample(1, now, 1, .99, 0, now + DockNativeMotion.MAX_AGE_NS + 1) == null);
         for (double invalid : new double[]{Double.NaN, Double.POSITIVE_INFINITY, -1, 2.1}) {
-            check(DockNativeMotion.decode(packet(1, now, 1, invalid), 0, now) == null);
+            check(sample(1, now, 1, invalid, 0, now) == null);
         }
-        check(DockNativeMotion.decode(packet(1, now, 3, .99), 0, now) == null);
+        check(sample(1, now, 3, .99, 0, now) == null);
+        check(sample(1, now, 1, .99, 9, 0, now) == null);
+        check(sample(1, now, 1, .99, -1, 0, now) == null);
+        Boolean[] hidden = {null, false, false, true, true, true, true, false, true};
+        for (int state = 0; state < hidden.length; state++) {
+            DockNativeMotion.Sample edit = sample(state + 1L, now, 0, 1, state, 0, now);
+            check(edit != null && edit.editHidden() == hidden[state]);
+        }
         DockNativeMotion motion = new DockNativeMotion();
-        motion.accept(DockNativeMotion.decode(packet(1, now, 2, .96), 0, now));
+        motion.accept(sample(1, now, 2, .96, 0, now));
         near(motion.progress(), 0); // Folder/home return cannot start a recents lift.
-        motion.accept(DockNativeMotion.decode(packet(2, now, 1, .99), 0, now));
+        motion.accept(sample(2, now, 1, .99, 0, now));
         near(motion.progress(), .2f); // Follows drag before wallpaper overview arrives.
         near(motion.offsetY(3.25f, 2000), -13);
-        motion.accept(DockNativeMotion.decode(packet(3, now, 1, .95), 0, now));
+        motion.accept(sample(3, now, 1, .95, 0, now));
         near(motion.progress(), 1);
-        motion.accept(DockNativeMotion.decode(packet(4, now, 1, .945), 0, now));
+        motion.accept(sample(4, now, 1, .945, 0, now));
         near(motion.progress(), 1.1f); // Preserve measured small native spring overshoot.
-        motion.accept(DockNativeMotion.decode(packet(5, now, 1, .91), 0, now));
+        motion.accept(sample(5, now, 1, .91, 0, now));
         near(motion.progress(), 1.2f); // Independent safety limit of 24dp.
-        motion.accept(DockNativeMotion.decode(packet(6, now, 2, .98), 0, now));
+        motion.accept(sample(6, now, 2, .98, 0, now));
         near(motion.progress(), .4f);
-        check(!motion.accept(DockNativeMotion.decode(packet(5, now, 1, .95), 0, now)));
+        check(!motion.accept(sample(5, now, 1, .95, 0, now)));
         near(motion.progress(), .4f);
-        motion.accept(DockNativeMotion.decode(packet(7, now, 2, 1), 0, now));
+        motion.accept(sample(7, now, 2, 1, 0, now));
         near(motion.progress(), 0);
-        motion.accept(DockNativeMotion.decode(packet(8, now, 2, .96), 0, now));
+        motion.accept(sample(8, now, 2, .96, 0, now));
         near(motion.progress(), 0); // Return completed: no stale latch for another scene.
-        motion.accept(DockNativeMotion.decode(packet(9, now, 1, .8), 0, now));
-        near(motion.progress(), 0); // Legitimate unrelated zoom cannot become a 24dp lift.
+        motion.accept(sample(9, now, 1, .8, 0, now));
+        near(motion.progress(), 1.2f); // Large authenticated drag remains clamped, never snaps home.
         motion.reset();
-        motion.accept(DockNativeMotion.decode(packet(9, now, 1, .97), 0, now));
-        motion.accept(DockNativeMotion.decode(packet(10, now, 0, .96), 0, now));
+        motion.accept(sample(9, now, 0, .96, 0, now));
+        near(motion.progress(), 0); // Scene 0 cannot start recents by itself.
+        motion.accept(sample(10, now, 1, .97, 0, now));
+        motion.accept(sample(11, now, 0, .96, 0, now));
+        near(motion.progress(), .8f); // Transient scene 0 during a drag preserves the position.
+        motion.accept(sample(12, now, 0, 1, 0, now));
         near(motion.progress(), 0);
         motion.reset();
-        motion.accept(DockNativeMotion.decode(packet(1, now, 1, .98), 0, now));
+        motion.accept(sample(1, now, 1, .98, 0, now));
         near(motion.progress(), .4f);
         near(motion.offsetY(Float.NaN, 2000), 0);
         near(motion.offsetY(3.25f, 1), -1);

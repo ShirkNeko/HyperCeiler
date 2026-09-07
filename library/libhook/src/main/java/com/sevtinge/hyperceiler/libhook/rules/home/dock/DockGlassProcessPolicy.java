@@ -23,6 +23,14 @@ public final class DockGlassProcessPolicy {
     public synchronized void release(Object token) { owners.remove(token); }
     public synchronized void clear() { owners.clear(); }
 
+    /** A lease is protectable only after its renderer PID still resolves to the verified UID. */
+    public synchronized boolean hasLiveOwner(IntUnaryOperator uidForPid) {
+        for (Owner owner : owners.values()) {
+            if (owner.pid > 0 && uidForPid.applyAsInt(owner.pid) == owner.uid) return true;
+        }
+        return false;
+    }
+
     public synchronized int[] filter(int[] requested, boolean pids, IntUnaryOperator uidForPid) {
         if (owners.isEmpty()) return requested;
         int[] result = new int[requested.length];

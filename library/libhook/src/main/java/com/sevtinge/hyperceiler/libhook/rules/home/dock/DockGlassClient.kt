@@ -37,6 +37,10 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
         var recoveryPending = false
         var client: ContentProviderClient? = null
         var refreshes = 0
+        var readinessEpoch = 0
+        @Volatile var lastRefreshRequest = 0L
+        @Volatile var refreshRequestEpoch = 0
+        @Volatile var refreshAllowed = true
 
         fun request(method: String, args: Bundle? = null): Bundle {
             // Keep an UNSTABLE reference for the lifetime of the active windowless host,
@@ -145,6 +149,7 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
             ticket.lifetime = response.getBinder("lifetime") ?: error("Renderer returned no lifetime token")
             if (ticket.cancelled || closed) { dispose(ticket); return }
             val generation = ticket.attempts
+            val readinessEpoch = ++ticket.readinessEpoch
             val death = IBinder.DeathRecipient {
                 worker.post {
                     if (generation == ticket.attempts) recover(ticket, "renderer died")
@@ -179,27 +184,32 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
             })
             changed()
             // Parent first, then wait for the vendor background texture, not just a drawn buffer.
-            checkBackground(ticket, 0, generation)
-        } catch (error: Exception) {
+            checkBackground(ticket, 0, generation, readinessEpoch)
+        } catch (error: IllegalStateException) {
+            recover(ticket, "create ${error.javaClass.simpleName}: ${error.message?.take(160)}")
+        } catch (error: RemoteException) {
+            recover(ticket, "create ${error.javaClass.simpleName}: ${error.message?.take(160)}")
+        } catch (error: SecurityException) {
             recover(ticket, "create ${error.javaClass.simpleName}: ${error.message?.take(160)}")
         }
     }
 
-    private fun checkBackground(ticket: Ticket, attempt: Int, generation: Int) {
+    private fun checkBackground(ticket: Ticket, attempt: Int, generation: Int, readinessEpoch: Int) {
         worker.postDelayed(fun() {
             if (ticket.cancelled || ticket.dead || closed) return
-            if (generation != ticket.attempts) return
+            if (generation != ticket.attempts || readinessEpoch != ticket.readinessEpoch) return
             try {
                 val status = ticket.request("dock_glass_status")
                 status.getString("error")?.let { error(it) }
+                val wasReady = ticket.ready
                 ticket.ready = ticket.lease?.isAttached == true && status.getBoolean("backgroundReady")
+                if (wasReady != ticket.ready) changed()
                 if (ticket.ready) {
                     ticket.previouslyReady = true
                     ticket.consecutiveFailures = 0
                     record("glass ready id=${ticket.id} attempt=${ticket.attempts} check=${attempt + 1}")
-                    changed()
                 } else if (attempt + 1 < DockGlassRetryPolicy.BACKGROUND_CHECKS) {
-                    checkBackground(ticket, attempt + 1, generation)
+                    checkBackground(ticket, attempt + 1, generation, readinessEpoch)
                 } else {
                     recover(ticket, "background texture timeout after ${attempt + 1} checks")
                 }
@@ -222,23 +232,76 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
         }
     }
 
-    /** Refresh only HyperCeiler's own windowless View after its parent becomes visible again. */
-    fun refresh(ticket: Ticket) {
-        // The parent's show is part of WMS's sync transaction. Refresh after that
-        // transaction has had several display frames to commit, not while still hidden.
-        worker.postDelayed(refresh@{
-            if (closed || ticket.cancelled || ticket.dead || ticket.lease == null) return@refresh
+    /** Verify HyperCeiler's own texture after its parent becomes visible again. */
+    fun resume(ticket: Ticket) {
+        val requestedAt = SystemClock.uptimeMillis()
+        val requestEpoch: Int
+        synchronized(ticket) {
+            ticket.refreshAllowed = true
+            // Visibility and wallpaper-home callbacks can describe the same return.
+            if (requestedAt - ticket.lastRefreshRequest < 250) return
+            ticket.lastRefreshRequest = requestedAt
+            requestEpoch = ++ticket.refreshRequestEpoch
+        }
+        // The parent's show is part of WMS's sync transaction. Probe after that
+        // transaction commits; a healthy producer is never toggled or recreated.
+        worker.postDelayed(resume@{
+            if (closed || ticket.cancelled || ticket.dead || ticket.lease == null
+                || !ticket.refreshAllowed || requestEpoch != ticket.refreshRequestEpoch) return@resume
+            // Initial creation already owns its readiness loop. A resume probe is
+            // meaningful only after this generation has displayed native glass.
+            if (!ticket.previouslyReady) return@resume
             runCatching {
-                val response = ticket.request("dock_glass_refresh")
+                val response = ticket.request("dock_glass_probe")
                 response.getString("error")?.let { error(it) }
-                ticket.refreshes++
-                if (ticket.refreshes <= 8) {
-                    record("glass background refresh id=${ticket.id} count=${ticket.refreshes}")
+                val healthy = ticket.lease?.isAttached == true
+                    && response.getBoolean("backgroundReady")
+                if (healthy) {
+                    val wasReady = ticket.ready
+                    ticket.ready = true
+                    ticket.previouslyReady = true
+                    ticket.consecutiveFailures = 0
+                    if (!wasReady) changed()
+                } else {
+                    // Put compositor fallback behind the Dock before restarting the
+                    // private producer. This prevents a transparent/white flash.
+                    val wasReady = ticket.ready
+                    ticket.ready = false
+                    if (wasReady) changed()
+                    worker.postDelayed({ hardRefresh(ticket, requestEpoch) }, if (wasReady) 80 else 0)
                 }
             }.onFailure {
-                recover(ticket, "refresh ${it.javaClass.simpleName}: ${it.message?.take(160)}")
+                recover(ticket, "resume probe ${it.javaClass.simpleName}: ${it.message?.take(160)}")
             }
         }, 50)
+    }
+
+    private fun hardRefresh(ticket: Ticket, requestEpoch: Int) {
+        if (closed || ticket.cancelled || ticket.dead || ticket.lease == null
+            || !ticket.refreshAllowed || requestEpoch != ticket.refreshRequestEpoch) return
+        runCatching {
+            val response = ticket.request("dock_glass_refresh")
+            response.getString("error")?.let { error(it) }
+            ticket.refreshes++
+            val generation = ticket.attempts
+            val readinessEpoch = ++ticket.readinessEpoch
+            if (ticket.refreshes <= 8) {
+                record("glass stale producer restarted id=${ticket.id} count=${ticket.refreshes}")
+            }
+            checkBackground(ticket, 0, generation, readinessEpoch)
+        }.onFailure {
+            recover(ticket, "refresh ${it.javaClass.simpleName}: ${it.message?.take(160)}")
+        }
+    }
+
+    /** Cancel delayed refresh/readiness work while the launcher parent is hidden. */
+    fun pauseRefresh(ticket: Ticket) {
+        synchronized(ticket) {
+            ticket.refreshAllowed = false
+            ticket.refreshRequestEpoch++
+            ticket.lastRefreshRequest = 0
+        }
+        worker.post { ticket.readinessEpoch++ }
     }
 
     private fun recover(ticket: Ticket, reason: String) {

@@ -1,4 +1,8 @@
-# OS4 Dock v20: dynamic motion/edit resolution and reconnect
+# OS4 Dock v25: dynamic motion resolution and suspend-aware reconnect
+
+The transport distinguishes actual device suspend from ordinary process scheduling by
+comparing `CLOCK_BOOTTIME` and `CLOCK_MONOTONIC` deltas. A long launcher scheduling or
+freezer gap advances both clocks and no longer tears down a healthy Binder channel.
 
 The production observer no longer has a launcher Build ID/address table, fixed
 class IDs, or fixed launcher payload offsets. The old probe and profile-only
@@ -14,10 +18,11 @@ tests were removed (recoverable from Git history).
 2. Match reviewed ARM64 instruction shapes after masking branch displacements,
    pool/field operands and materialized immediates. These are compiler shapes,
    not offsets from a library base. Unknown shapes remain unsupported.
-3. Require unique scene, setter, parameter-string, factory and EditMode callback
-   matches. The scale
+3. Require unique scene, setter, parameter-string and factory matches. The scale
    callback has two shape matches in the known artifacts: disambiguate through
-   its two BL targets and the setter's receiver-field accesses.
+   its two BL targets and the setter's receiver-field accesses. EditMode is an
+   optional, independently verified observer; a changed edit closure cannot disable
+   the real-time recents path.
 4. Decode class allocation tags and field accesses, then independently check
    constructor stores against parameter/setter reads. Require aligned fields
    inside the decoded allocation size. Invalid or ambiguous input fails closed.
@@ -69,23 +74,26 @@ waiting on eventfd again.
 
 ## Verification (2026-09-08)
 
-- Artifact resolver passed against both launcher 6179 and 6236, discovering
-  their different function locations and parameter class IDs (1773 and 1777).
+- Artifact resolver passed against launcher 6179, 6236 and 6241, discovering
+  their function locations and parameter class IDs dynamically. Launcher 6241
+  deliberately contains two scale-shape candidates; setter call/field relationships
+  select the correct callback without a build address table.
 - Tests relocate executable ranges, mutate the parameter CID and all four
   relevant field offsets, reject inconsistent accessors, duplicate matches,
-  missing callbacks and empty input.
+  missing required callbacks and empty input. Missing optional EditMode retains
+  motion resolution with edit observation disabled.
 - Eight Java policy tests pass, including packets, replay, fallback continuity,
   background-mode migration, glass presets and endpoint ownership.
 - The production assembly was cross-compiled and executed on the connected
   phone using HyperCeiler-only synthetic fixtures. Registers x0-x15, NZCV,
   Dart stack, unchanged fixtures, scene guards, eventfd notifications and
   alternate class IDs/field layouts passed. Temporary phone files were removed.
-- Launcher 6236 resolved the v20 native hooks at runtime. Device diagnostics then
+- Launcher 6236 resolved the v21 native hooks at runtime. Device diagnostics then
   confirmed exact EditState transitions (`state=4` hidden, `state=2` shown) and
-  per-frame native-vsync motion. Java diagnostic v21 removes the superseded wallpaper
-  edit inference, adds cold-return refresh/expiry safeguards, and versions the private
-  Binder transaction once so callbacks left by pre-v21 hot reloads cannot consume the
-  current stream. Cleaned-up v21 callbacks explicitly yield to their successor.
+  per-frame native-vsync motion. Java diagnostic v23 removes the superseded wallpaper
+  edit inference, adds cold-return refresh/expiry safeguards, and uses an acknowledged
+  private Binder transaction. Every active endpoint restores the input Parcel and yields
+  before the final reply, so callbacks retained by hot reload cannot starve their successor.
 
 Host artifact test (pass paths to extracted ELF files, not APKs):
 

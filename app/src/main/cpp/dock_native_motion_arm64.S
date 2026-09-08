@@ -98,21 +98,32 @@ dock_motion_scale_entry:
     b.ne 90f
     layout 16, DOCK_SURFACE_OFFSET
     ldr w16, [x2, x16]
-    add x17, x22, #0x30
+    // isSurface varies across equivalent recents paths on OS4. Validate that
+    // both scene flags are canonical bools without assuming their polarity.
+    add x17, x22, #DOCK_DART_FALSE_FROM_NULL
+    cmp w16, w17
+    b.eq 70f
+    add x17, x22, #DOCK_DART_TRUE_FROM_NULL
     cmp w16, w17
     b.ne 90f
+70:
     layout 16, DOCK_RECENTS_OFFSET
     ldr w16, [x2, x16]
-    add x17, x22, #0x20
+    add x17, x22, #DOCK_DART_FALSE_FROM_NULL
     cmp w16, w17
-    b.ne 80f
-    // Recents targets are at/near .95; exclude folder/app zooms even if their
-    // params inherit the default shouldTryDisableByRecents=true flag.
+    b.eq 71f
+    add x17, x22, #DOCK_DART_TRUE_FROM_NULL
+    cmp w16, w17
+    b.ne 90f
+71:
+    // Recents targets are at/near .95; the scale band excludes folder/app zooms
+    // without relying on scene-flag polarity that OS4 changes by call path.
     layout 16, DOCK_SCALE_OFFSET
     ldr x16, [x2, x16]
     cmp x16, x11
     b.eq 80f
     b.hi 90f
+    // 0.95 is a semantic scene threshold, not an address or object offset.
     mov x17, #0xae14
     movk x17, #0xe147, lsl #16
     movk x17, #0x147a, lsl #32

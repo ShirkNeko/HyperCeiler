@@ -143,7 +143,7 @@ inline std::optional<Resolution> resolve(std::span<const CodeRange> ranges) {
     const auto factory = find(ranges, kFactoryShape);
     const auto edit = find(ranges, kEditShape);
     if (anim.size() != 1 || immediate.size() != 1 || params.size() != 1
-        || factory.size() != 1 || edit.size() != 1) return {};
+        || factory.size() != 1) return {};
     const auto allocation = call_target(factory[0], 0);
     if (!allocation) return {};
     const auto stub = at(ranges, *allocation, 3);
@@ -185,7 +185,10 @@ inline std::optional<Resolution> resolve(std::span<const CodeRange> ranges) {
     const auto params_id = (*params_tag >> kClassIdShift) & kClassIdMask;
     const auto double_id = (*double_tag >> kClassIdShift) & kClassIdMask;
     if (params_id == 0 || double_id == 0 || params_id == double_id) return {};
-    return Resolution{scale_match->address, anim[0].address, immediate[0].address, edit[0].address,
+    // Edit-mode observation is independent from recents motion. A launcher may
+    // reshape that optional closure without disabling the already verified scale path.
+    const uintptr_t edit_address = edit.size() == 1 ? edit[0].address : 0;
+    return Resolution{scale_match->address, anim[0].address, immediate[0].address, edit_address,
         {params_id, double_id, static_cast<uint32_t>(alpha), static_cast<uint32_t>(scale),
         static_cast<uint32_t>(surface), static_cast<uint32_t>(recents), static_cast<uint32_t>(double_value)}};
 }

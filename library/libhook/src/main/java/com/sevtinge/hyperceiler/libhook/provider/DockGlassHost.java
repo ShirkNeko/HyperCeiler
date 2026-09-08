@@ -50,10 +50,14 @@ final class DockGlassHost {
         final View backdrop;
         final IBinder owner;
         final IBinder.DeathRecipient death;
+        final boolean dark;
+        final int radiusPx;
         SurfaceControlViewHost.SurfacePackage parcel;
-        Entry(SurfaceControlViewHost host, View view, View backdrop, IBinder owner, IBinder.DeathRecipient death) {
+        Entry(SurfaceControlViewHost host, View view, View backdrop, IBinder owner,
+              IBinder.DeathRecipient death, boolean dark, int radiusPx) {
             this.host = host; this.view = view; this.backdrop = backdrop;
-            this.owner = owner; this.death = death;
+            this.owner = owner; this.death = death; this.dark = dark;
+            this.radiusPx = radiusPx;
         }
     }
 
@@ -101,6 +105,7 @@ final class DockGlassHost {
                 case "dock_glass_diagnostics" -> result.complete(diagnostics());
                 case "dock_glass_create" -> create(context, id, args, result);
                 case "dock_glass_status" -> result.complete(status(id));
+                case "dock_glass_probe" -> result.complete(probe(id));
                 case "dock_glass_refresh" -> result.complete(refresh(id));
                 case "dock_glass_release" -> { release(id); result.complete(Bundle.EMPTY); }
                 default -> throw new IllegalArgumentException("Unknown glass operation");
@@ -163,7 +168,8 @@ final class DockGlassHost {
         backdrop.addView(view, new FrameLayout.LayoutParams(width, height));
         SurfaceControlViewHost host = new SurfaceControlViewHost(displayContext, display, new Binder());
         IBinder.DeathRecipient death = () -> main.post(() -> release(id));
-        Entry entry = new Entry(host, view, backdrop, owner, death);
+        boolean dark = args.getBoolean("dark");
+        Entry entry = new Entry(host, view, backdrop, owner, death, dark, (int) radius);
         entries.put(id, entry);
         owner.linkToDeath(death, 0);
         WindowManager.LayoutParams layout = new WindowManager.LayoutParams(width, height,
@@ -175,7 +181,7 @@ final class DockGlassHost {
         layout.setTitle("HyperCeiler Dock glass");
         HiddenApiBypass.invoke(SurfaceControlViewHost.class, host, "setView", backdrop, layout);
         // setView schedules attachment; configure only after the View has a ViewRootImpl.
-        view.post(() -> configure(id, entry, args.getBoolean("dark"), result));
+        view.post(() -> configure(id, entry, result));
     }
 
     private static void validateHost(int width, int height, float radius, IBinder owner) {
@@ -196,7 +202,7 @@ final class DockGlassHost {
         }
     }
 
-    private void configure(String id, Entry entry, boolean dark, CompletableFuture<Bundle> result) {
+    private void configure(String id, Entry entry, CompletableFuture<Bundle> result) {
         View view = entry.view;
         View backdrop = entry.backdrop;
         if (result.isDone() || !entries.containsKey(id)) return;
@@ -204,28 +210,7 @@ final class DockGlassHost {
             if (!view.isAttachedToWindow() || !view.isHardwareAccelerated()) {
                 throw new UnsupportedOperationException("No hardware-accelerated ViewRoot");
             }
-            if (!enableOwnBackground(backdrop)) {
-                throw new UnsupportedOperationException("Cross-window background was rejected");
-            }
-            invoke(backdrop, "setMiBackgroundBlurMode", 1);
-            invoke(backdrop, "setMiBackgroundBlurRadius", 120);
-            invoke(backdrop, "setMiViewBlurMode", 0);
-            invoke(view, "setMiBackgroundBlurMode", 0);
-            invoke(view, "setMiViewBlurMode", 1);
-            invoke(backdrop, "setMiGlassBlurRadius", DockGlassPreset.SMALL_BLUR_RADIUS,
-                    DockGlassPreset.BIG_BLUR_RADIUS);
-            // CCMaterialToken clears its solid background and enables native glass
-            // clipping enhancement before BionicsStyle applies the material token.
-            try {
-                invoke(view, "setMiBackgroundBlurEnhanceFlag", DockGlassPreset.GLASS_ENHANCE_FLAG,
-                        DockGlassPreset.GLASS_ENHANCE_FLAG);
-                view.setClipToOutline(false);
-            } catch (Exception unsupported) {
-                // Older vendor APIs retain the ordinary rounded-outline clipping.
-                Log.i(TAG, "Glass clip enhancement unavailable; rounded outline retained");
-            }
-            invoke(view, "setMiViewMaterialType", DockGlassPreset.MATERIAL_TYPE);
-            invoke(view, "setMiGlass", (Object) DockGlassPreset.parameters(dark));
+            applyMaterial(entry);
             view.getViewTreeObserver().registerFrameCommitCallback(() -> main.post(() -> commitFrame(id, entry, result)));
             view.invalidate();
         } catch (Throwable error) {
@@ -258,22 +243,56 @@ final class DockGlassHost {
     private Bundle status(String id) throws Exception {
         Bundle result = new Bundle();
         Entry entry = entries.get(id);
-        boolean ready = false;
-        long timestamp = 0;
-        if (entry != null && entry.view.isAttachedToWindow()) {
-            Object root = invoke(entry.view, "getViewRootImpl");
-            Field field = ownField(root.getClass(), "mSurTex");
-            if (field != null) {
-                Object texture = field.get(root);
-                // Only a timestamp, never copy, retain or expose background pixels.
-                if (texture instanceof SurfaceTexture) timestamp = ((SurfaceTexture) texture).getTimestamp();
-                ready = timestamp > 0;
-            }
-        }
+        long timestamp = backgroundTimestamp(entry);
+        boolean active = producerActive(entry);
+        boolean ready = active && timestamp > 0;
         result.putBoolean("backgroundReady", ready);
+        result.putBoolean("producerActive", active);
         result.putLong("textureTimestamp", timestamp);
-        record(id, "backgroundReady=" + ready + ", textureTimestamp=" + timestamp);
+        record(id, "backgroundReady=" + ready + ", producerActive=" + active
+                + ", textureTimestamp=" + timestamp);
         return result;
+    }
+
+    private Bundle probe(String id) throws Exception {
+        Entry entry = entries.get(id);
+        if (entry == null || !entry.view.isAttachedToWindow()) {
+            throw new IllegalStateException("Dock glass host is not attached");
+        }
+        // A static wallpaper can legitimately retain the same texture timestamp.
+        // Inspect the vendor producer state instead of requiring a new frame.
+        long timestamp = backgroundTimestamp(entry);
+        boolean active = producerActive(entry);
+        Bundle result = new Bundle();
+        result.putBoolean("backgroundReady", active && timestamp > 0);
+        result.putBoolean("producerActive", active);
+        result.putLong("textureTimestamp", timestamp);
+        return result;
+    }
+
+    private static long backgroundTimestamp(Entry entry) throws Exception {
+        if (entry == null || !entry.view.isAttachedToWindow()) return 0;
+        Object root = invoke(entry.view, "getViewRootImpl");
+        Field field = ownField(root.getClass(), "mSurTex");
+        if (field == null) return 0;
+        Object texture = field.get(root);
+        // Only a timestamp, never copy, retain or expose background pixels.
+        return texture instanceof SurfaceTexture ? ((SurfaceTexture) texture).getTimestamp() : 0;
+    }
+
+    private static boolean producerActive(Entry entry) throws Exception {
+        if (entry == null || !entry.view.isAttachedToWindow()) return false;
+        Object root = invoke(entry.view, "getViewRootImpl");
+        if (root == null) return false;
+        Field textureField = ownField(root.getClass(), "mSurTex");
+        Field stateField = ownField(root.getClass(), "mLastSfState");
+        Field visibleField = ownField(root.getClass(), "mTextureVis");
+        if (textureField == null || stateField == null || visibleField == null) return false;
+        Object texture = textureField.get(root);
+        return texture instanceof SurfaceTexture
+                && !((SurfaceTexture) texture).isReleased()
+                && stateField.getInt(root) == 1
+                && visibleField.getBoolean(root);
     }
 
     private Bundle refresh(String id) throws Exception {
@@ -281,17 +300,47 @@ final class DockGlassHost {
         if (entry == null || !entry.view.isAttachedToWindow()) {
             throw new IllegalStateException("Dock glass host is not attached");
         }
-        // A hidden launcher parent can stop the vendor pass-window texture producer.
-        // Reassert the idempotent flag and schedule a fresh HWUI frame when the owned
-        // Dock parent becomes visible again. Never toggle a global blur setting.
-        if (!enableOwnBackground(entry.backdrop)) {
-            throw new IllegalStateException("Cross-window background refresh was rejected");
-        }
-        entry.backdrop.invalidate();
-        entry.view.invalidate();
+        // A hidden launcher parent can leave the vendor texture flag set while its
+        // producer is stopped. Restart only OUR windowless backdrop, then reapply the
+        // native material because the vendor ViewRoot can discard it with the texture.
+        invoke(entry.backdrop, "setPassWindowBlurEnabled", false);
+        applyMaterial(entry);
+        invalidateMaterial(entry);
+        main.postDelayed(() -> {
+            if (entries.get(id) == entry) invalidateMaterial(entry);
+        }, 120);
         Bundle result = new Bundle();
         result.putBoolean("refreshed", true);
         return result;
+    }
+
+    private void applyMaterial(Entry entry) throws Exception {
+        View view = entry.view;
+        View backdrop = entry.backdrop;
+        if (!enableOwnBackground(backdrop)) {
+            throw new UnsupportedOperationException("Cross-window background was rejected");
+        }
+        invoke(backdrop, "setMiBackgroundBlurMode", 1);
+        invoke(backdrop, "setMiBackgroundBlurRadius", 120);
+        invoke(backdrop, "setMiViewBlurMode", 0);
+        invoke(view, "setMiBackgroundBlurMode", 0);
+        invoke(view, "setMiViewBlurMode", 1);
+        invoke(backdrop, "setMiGlassBlurRadius", DockGlassPreset.SMALL_BLUR_RADIUS,
+                DockGlassPreset.BIG_BLUR_RADIUS);
+        try {
+            invoke(view, "setMiBackgroundBlurEnhanceFlag", DockGlassPreset.GLASS_ENHANCE_FLAG,
+                    DockGlassPreset.GLASS_ENHANCE_FLAG);
+            view.setClipToOutline(false);
+        } catch (Exception unsupported) {
+            Log.i(TAG, "Glass clip enhancement unavailable; rounded outline retained");
+        }
+        invoke(view, "setMiViewMaterialType", DockGlassPreset.MATERIAL_TYPE);
+        invoke(view, "setMiGlass", (Object) DockGlassPreset.parameters(entry.dark));
+    }
+
+    private static void invalidateMaterial(Entry entry) {
+        entry.backdrop.postInvalidateOnAnimation();
+        entry.view.postInvalidateOnAnimation();
     }
 
     private Bundle diagnostics() throws Exception {

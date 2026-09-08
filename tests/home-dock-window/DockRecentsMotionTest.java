@@ -25,6 +25,12 @@ public class DockRecentsMotionTest {
             check(Boolean.FALSE.equals(DockRecentsMotion.overviewTarget(command, "startAnim", scale)), "OS4 exit scene " + scale);
             check(Boolean.FALSE.equals(DockRecentsMotion.overviewTarget(command, "setTo", scale)), "instant exit scene " + scale);
         }
+        check(DockRecentsMotion.homeTarget(command, "startAnim", 1.0499999523162842), "device home refresh");
+        check(DockRecentsMotion.homeTarget(command, "setTo", 1.0), "legacy home refresh");
+        for (double scale : new double[]{1.06, 1.113, 1.14, 1.18, 1.197, 1.239}) {
+            check(!DockRecentsMotion.homeTarget(command, "startAnim", scale), "non-home does not refresh " + scale);
+        }
+        check(!DockRecentsMotion.homeTarget("other", "startAnim", 1.05), "foreign command does not refresh");
         check(Boolean.TRUE.equals(DockRecentsMotion.overviewTarget(command, "setTo", 1.113f)), "instant recents endpoint");
         for (double scale : new double[]{1.0, 1.14, 1.18}) {
             check(Boolean.FALSE.equals(DockRecentsMotion.overviewTarget(command, "startAnim", scale)), "exit scene " + scale);

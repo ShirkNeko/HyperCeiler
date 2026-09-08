@@ -108,15 +108,17 @@ void *motion_worker(void *) {
         || hook_function(reinterpret_cast<void *>(resolved.set),
             reinterpret_cast<void *>(dock_motion_set_entry), &dock_motion_set_original) != 0
         || hook_function(reinterpret_cast<void *>(resolved.scale),
-            reinterpret_cast<void *>(dock_motion_scale_entry), &dock_motion_scale_original) != 0
-        || hook_function(reinterpret_cast<void *>(resolved.edit),
-            reinterpret_cast<void *>(dock_edit_entry), &dock_edit_original) != 0) {
+            reinterpret_cast<void *>(dock_motion_scale_entry), &dock_motion_scale_original) != 0) {
         __android_log_print(ANDROID_LOG_WARN, kTag, "motion hooks unavailable; no subscription enabled");
         return nullptr;
     }
+    const bool edit_installed = resolved.edit != 0
+        && hook_function(reinterpret_cast<void *>(resolved.edit),
+            reinterpret_cast<void *>(dock_edit_entry), &dock_edit_original) == 0;
     __android_log_print(ANDROID_LOG_INFO, kTag,
-        "dynamic motion v20 resolved: paramsCID=%u doubleCID=%u edit=dynamic",
-        resolved.layout.params_class_id, resolved.layout.double_class_id);
+        "dynamic motion v25 resolved: paramsCID=%u doubleCID=%u edit=%s",
+        resolved.layout.params_class_id, resolved.layout.double_class_id,
+        edit_installed ? "dynamic" : "unavailable");
     run_dock_motion();
     return nullptr;
 }

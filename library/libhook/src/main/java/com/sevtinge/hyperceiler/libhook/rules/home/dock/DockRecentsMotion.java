@@ -40,6 +40,16 @@ public final class DockRecentsMotion {
         return null;
     }
 
+    /** Exact home preset only; app-launch and home-hide presets must not rearm glass. */
+    public static boolean homeTarget(String command, String action, double scale) {
+        if (!WALLPAPER_ACTION.equals(command) || !("startAnim".equals(action) || "setTo".equals(action))
+                || !Double.isFinite(scale)) return false;
+        for (double base : BASE_SCALES) {
+            if (Math.abs(scale / base - 1.0) < 0.0001) return true;
+        }
+        return false;
+    }
+
     public boolean setOverview(boolean overview, long now) {
         double next = overview ? 1 : 0;
         if (target == next) return false; // Repeated commands must not restart the animation.

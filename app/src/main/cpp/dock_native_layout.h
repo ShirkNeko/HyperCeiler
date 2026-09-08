@@ -8,6 +8,10 @@
 #define DOCK_SURFACE_OFFSET 16
 #define DOCK_RECENTS_OFFSET 20
 #define DOCK_DOUBLE_VALUE_OFFSET 24
+// Offsets of Dart's canonical bool objects from the null object in x22. These
+// are tagged-object ABI constants, not launcher addresses or heap offsets.
+#define DOCK_DART_FALSE_FROM_NULL 0x20
+#define DOCK_DART_TRUE_FROM_NULL 0x30
 #ifndef __ASSEMBLER__
 #include "dock_native_resolver.h"
 static_assert(offsetof(dock_motion::Layout, params_class_id) == DOCK_PARAMS_CID);

@@ -49,7 +49,7 @@ int main(int argc, char **argv) {
         assert(relocated && relocated->scale == original->scale + 0x7123450000ULL);
         assert(relocated->animate == original->animate + 0x7123450000ULL);
         assert(relocated->set == original->set + 0x7123450000ULL);
-        assert(relocated->edit == original->edit + 0x7123450000ULL);
+        assert(relocated->edit == (original->edit ? original->edit + 0x7123450000ULL : 0));
         // Duplicate identities must fail closed, never select the first match.
         auto duplicate = ranges;
         duplicate.push_back(ranges.front());
@@ -60,12 +60,15 @@ int main(int argc, char **argv) {
         *instruction = 0;
         assert(!resolve(ranges));
         *instruction = saved;
-        const auto edit = at(ranges, relocated->edit, kEditShape.words);
-        auto *edit_instruction = const_cast<uint32_t *>(edit.data());
-        const auto saved_edit = *edit_instruction;
-        *edit_instruction = 0;
-        assert(!resolve(ranges));
-        *edit_instruction = saved_edit;
+        if (relocated->edit) {
+            const auto edit = at(ranges, relocated->edit, kEditShape.words);
+            auto *edit_instruction = const_cast<uint32_t *>(edit.data());
+            const auto saved_edit = *edit_instruction;
+            *edit_instruction = 0;
+            const auto without_edit = resolve(ranges);
+            assert(without_edit && without_edit->edit == 0);
+            *edit_instruction = saved_edit;
+        }
         const auto factory = find(ranges, kFactoryShape).front();
         const auto params = find(ranges, kParamsShape).front();
         const auto setter = find(ranges, kSetShape).front();

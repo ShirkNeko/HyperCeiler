@@ -98,7 +98,15 @@ int main() {
         value.alpha = 1;
         value.surface = 0x10000021;
         invoke_fixture(dock_motion_anim_entry, value);
-        assert(scene() == 0);
+        assert(scene() == 1); // OS4 uses either bool polarity for equivalent recents paths.
+        value.recents = 0x10000031;
+        invoke_fixture(dock_motion_anim_entry, value);
+        assert(scene() == 1);
+        value.surface = 0x10000041;
+        invoke_fixture(dock_motion_anim_entry, value);
+        assert(scene() == 0); // A non-bool field still fails closed.
+        value.surface = 0x10000031;
+        value.recents = 0x10000021;
         value.header = 45ULL << 12;
         invoke_fixture(dock_motion_set_entry, value);
         assert(scene() == 0);

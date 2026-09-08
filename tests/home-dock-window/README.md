@@ -1,7 +1,8 @@
 # HyperOS 4 Dock window regression checks
 
-Current native implementation: [v20 dynamic motion/edit resolution, verification, and Binder reconnect](NATIVE_DYNAMIC_RESOLUTION.md).
-Java hook diagnostic version 21 additionally fixes remote glass surface lifetime and
+Current native implementation: [v25 dynamic motion resolution, optional edit observation,
+verification, acknowledged Binder reconnect, and suspend recovery](NATIVE_DYNAMIC_RESOLUTION.md).
+Java hook diagnostic version 24 additionally fixes remote glass surface lifetime and
 immediate recovery after a live renderer is force-stopped:
 attach and detach are serialized on the IPC worker, never deferred in WMS's sync
 transaction. Each generation is explicitly reparented to null before releasing
@@ -23,6 +24,10 @@ policy remain untouched. It first verifies exclusive package ownership and check
 PID-to-UID identity to prevent PID reuse. The lease is removed on disposal,
 mode change and hot reload; other UIDs are never altered and no persistent
 whitelist, global setting, started service or foreground service is created.
+Long process freezes and deep sleep are detected with `CLOCK_BOOTTIME`; the native
+worker rebuilds its dynamically acquired WindowManager Binder before forwarding the
+next coalesced launcher sample. A five-second idle health packet replaces frequent
+polling, while hook notifications remain enabled during reconnection.
 The probe/v7 sections below are historical investigation notes; their address
 profiles and opt-in probe have been removed and are not used by current builds.
 
@@ -102,6 +107,12 @@ twenty times at 500ms intervals. Successful readiness stops polling. Disabling
 or removal cancels the ticket, stale
 generation callbacks cannot affect a newer attempt, and hot reload stops the
 worker. Retries never run on the WMS thread or at frame rate.
+After a launcher-home preset or parent visibility return, the renderer first
+checks its own vendor ViewRoot producer state (`mLastSfState`, `mTextureVis` and
+the live `SurfaceTexture`). A healthy producer is left untouched; static wallpaper
+timestamps are valid and need not advance. Only a stale producer activates compositor
+fallback, restarts its own pass-window background, reapplies the native material,
+and rechecks readiness; the native layer is not exposed while that restart draws.
 
 `DockGlassRetryPolicyTest` verifies the backoff/readiness limits on the host JDK.
 Actual boot-time recovery and cancellation still require device verification.

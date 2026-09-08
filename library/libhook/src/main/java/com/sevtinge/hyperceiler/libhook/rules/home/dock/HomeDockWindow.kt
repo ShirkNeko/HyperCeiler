@@ -134,7 +134,7 @@ class HomeDockWindow : BaseHook() {
     }
 
     override fun init() {
-        glassClient.record("hook init diagnosticVersion=21 enabled=${settings.enabled} mode=${settings.mode}")
+        glassClient.record("hook init diagnosticVersion=25 enabled=${settings.enabled} mode=${settings.mode}")
         runCatching { processGuard.install() }
             .onFailure { glassClient.record("renderer guard unavailable=${it.javaClass.simpleName}") }
         val prefs = PrefsBridge.getSharedPreferences()
@@ -180,25 +180,38 @@ class HomeDockWindow : BaseHook() {
         private fun installNativeMotionTransaction() {
             runCatching {
                 val stub = loadClass("android.view.IWindowManager\$Stub")
-                stub.getDeclaredMethod("onTransact", Integer.TYPE, Parcel::class.java,
+                val transact = stub.getDeclaredMethod("onTransact", Integer.TYPE, Parcel::class.java,
                     Parcel::class.java, Integer.TYPE).apply { isAccessible = true }
-                    .createBeforeHook { param ->
+                transact.createBeforeHook { param ->
                         // A hot reload cannot physically remove callbacks already registered in
-                        // system_server. Let the newest hook handle this private transaction after
-                        // cleanup instead of consuming native frames in a stale endpoint.
+                        // system_server. Never short-circuit here: restore the Parcel so every live
+                        // endpoint can observe the same frame, including the newest hook.
                         if (stopped) return@createBeforeHook
                         val code = param.args[0] as Int
                         if (code != DockNativeMotionEndpoint.TRANSACTION_CODE) return@createBeforeHook
-                        val handled = runCatching {
-                            nativeMotionEndpoint.receive(code, param.args[1] as Parcel, param.args[3] as Int)
-                        }.getOrElse {
+                        val data = param.args[1] as Parcel
+                        val position = data.dataPosition()
+                        runCatching {
+                            nativeMotionEndpoint.receive(code, data, param.args[3] as Int)
+                        }.onFailure {
                             if (observed.add("native-motion-transaction-error")) {
                                 glassClient.record("native motion transaction rejected=${it.javaClass.simpleName}")
                             }
-                            true
+                        }.also {
+                            data.setDataPosition(position)
                         }
-                        if (handled) param.result = true
                     }
+                transact.createAfterHook { param ->
+                    if (stopped || param.args[0] as Int != DockNativeMotionEndpoint.TRANSACTION_CODE) {
+                        return@createAfterHook
+                    }
+                    // The original Stub sees an unknown private code. Confirm it only after all
+                    // before callbacks have had a chance to consume the restored input Parcel.
+                    val reply = param.args[2] as Parcel
+                    reply.setDataPosition(0)
+                    reply.writeInt(DockNativeMotionEndpoint.ACK)
+                    param.result = true
+                }
                 glassClient.record("native motion IWindowManager endpoint ready")
             }.onFailure {
                 glassClient.record("native motion IWindowManager endpoint unavailable=${it.javaClass.simpleName}")
@@ -265,12 +278,35 @@ class HomeDockWindow : BaseHook() {
                     if (extras == null) return
                     @Suppress("DEPRECATION")
                     val scale = (extras.get("scale_to") as? Number)?.toDouble() ?: return
-                    val isSetTo = extras.getString("action") == "setTo"
-                    val overview = DockRecentsMotion.overviewTarget(param.args[1] as String,
-                        extras.getString("action"), scale) ?: return
+                    val sceneAction = extras.getString("action")
+                    val command = param.args[1] as String
+                    val isSetTo = sceneAction == "setTo"
+                    val overview = DockRecentsMotion.overviewTarget(command, sceneAction, scale) ?: return
+                    if (DockRecentsMotion.homeTarget(command, sceneAction, scale)) {
+                        scheduleVisibleGlassRefresh(window)
+                    }
                     updateOverview(window, overview, isSetTo, scale)
                 }
             }
+        }
+
+        private fun scheduleVisibleGlassRefresh(window: Any) {
+            val wm = service ?: return
+            wm.getObjectFieldAs<Handler>(WM_HANDLER).postDelayed({
+                runCatching {
+                    synchronized(wm.getObjectFieldAs<Any>(WM_LOCK)) {
+                        synchronized(layers) {
+                            val layer = layers[window] ?: return@postDelayed
+                            if (stopped || layer.editMode) return@postDelayed
+                            val nativeLatest = nativeMotionEndpoint.latest(layer.nativeUid, layer.nativePid)
+                            if (layer.overview || nativeLatest != null) return@postDelayed
+                            if (!layer.nativeApplied && window.callMethod("isVisible") == true) {
+                                layer.glass?.let { glassClient.resume(it) }
+                            }
+                        }
+                    }
+                }.onFailure { reportMotionError(it) }
+            }, 120)
         }
 
         private fun recordCommand(action: Any?, extras: Bundle?) {
@@ -295,14 +331,20 @@ class HomeDockWindow : BaseHook() {
             val wasRunning = layer.motion.isRunning(now)
             val targetChanged = layer.motion.setOverview(overview, now)
             if (immediate) layer.motion.finish()
-            if (nativeMotionEndpoint.latest(layer.nativeUid, layer.nativePid) != null) {
-                if (targetChanged || (immediate && wasRunning)) {
+            val nativeLatest = nativeMotionEndpoint.latest(layer.nativeUid, layer.nativePid)
+            if (nativeLatest != null) {
+                if (targetChanged || (immediate && wasRunning)
+                    || layer.nativeScene == 1
+                    || (layer.overview && layer.nativeScene == 0)) {
                     scheduleAnimationFrame()
                     scheduleNativeExpiryCheck()
                 }
                 return
             }
-            if (targetChanged || (immediate && wasRunning)) {
+            if (!targetChanged && !(immediate && wasRunning)) {
+                glassClient.record("motion overview command without target change overview=$overview immediate=$immediate scale=$scale")
+                if (overview) scheduleAnimationFrame() else requestTraversal()
+            } else {
                 layer.motionSamples = 0
                 layer.motionEndPending = true
                 glassClient.record("motion target overview=$overview immediate=$immediate scale=$scale liftDp=${DockRecentsMotion.LIFT_DP} curve=sceneSpring")
@@ -340,9 +382,10 @@ class HomeDockWindow : BaseHook() {
             val windowVisible = window.callMethod("isVisible") == true
             val visible = windowVisible && !layer.editMode
             bindNativeMotion(layer)
-            if (!visible || !animationAvailable) layer.motion.finish()
+            if ((!visible && !layer.nativeApplied) || (!animationAvailable && !layer.nativeApplied)) layer.motion.finish()
             val glass = updateGlass(layer, config, bounds, dark, visible)
-            if (visible && layer.lastVisible == false && glass != null) glassClient.refresh(glass)
+            if (visible && layer.lastVisible == false && glass != null) glassClient.resume(glass)
+            if (!visible && layer.lastVisible == true && glass != null) glassClient.pauseRefresh(glass)
             layer.lastVisible = visible
             val appearance = Appearance(config, bounds, dark, visible, glass)
             val now = SystemClock.uptimeMillis()
@@ -610,6 +653,7 @@ class HomeDockWindow : BaseHook() {
             layer.nativeScene = -1
             layer.motionSamples = 0
             layer.motionEndPending = true
+            scheduleAnimationFrame()
             glassClient.record("native motion idle after overview exit; resuming return")
         }
         return layer.motion.offsetY(layer.density, layer.baseY, now)

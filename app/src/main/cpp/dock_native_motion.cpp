@@ -31,13 +31,21 @@ static_assert(std::atomic<uint32_t>::is_always_lock_free && sizeof(std::atomic<u
 
 namespace {
 constexpr char kTag[] = "HyperCeiler.DockNative";
-constexpr transaction_code_t kMotionTransaction = 0x00484345;
+constexpr transaction_code_t kMotionTransaction = 0x00484346;
+constexpr int32_t kMotionAck = 0x48434B32;
 constexpr char kWindowDescriptor[] = "android.view.IWindowManager";
 std::atomic<uint64_t> motion_sequence{0};
 
 void retry_delay() {
     timespec delay{0, 500000000};
     while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+}
+
+bool clock_ns(clockid_t clock, uint64_t &value) {
+    timespec now{};
+    if (clock_gettime(clock, &now) != 0) return false;
+    value = static_cast<uint64_t>(now.tv_sec) * 1000000000ULL + now.tv_nsec;
+    return true;
 }
 
 struct Sample {
@@ -48,10 +56,10 @@ struct Sample {
 };
 
 bool current_sample(Sample &sample) {
-    timespec now{};
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return false;
+    uint64_t now = 0;
+    if (!clock_ns(CLOCK_MONOTONIC, now)) return false;
     sample.sequence = motion_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-    sample.uptime_ns = static_cast<uint64_t>(now.tv_sec) * 1000000000ULL + now.tv_nsec;
+    sample.uptime_ns = now;
     sample.value = dock_motion_value.load(std::memory_order_acquire);
     sample.edit_state = dock_edit_state.load(std::memory_order_acquire);
     return true;
@@ -115,8 +123,12 @@ public:
         AParcel *output = nullptr;
         const binder_status_t status = AIBinder_transact(window_, kMotionTransaction,
             &input, &output, 0);
+        int32_t acknowledgment = 0;
+        const bool acknowledged = status == STATUS_OK && output != nullptr
+            && AParcel_readInt32(output, &acknowledgment) == STATUS_OK
+            && acknowledgment == kMotionAck;
         if (output != nullptr) AParcel_delete(output);
-        return status == STATUS_OK;
+        return acknowledged;
     }
 
 private:
@@ -126,19 +138,25 @@ private:
 
 bool prepare_dock_motion() {
     dock_motion_event = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    return dock_motion_event >= 0;
+    if (dock_motion_event < 0) return false;
+    // Hooks are installed only after this succeeds. Keep notifications enabled while
+    // Binder reconnects so a gesture racing recovery is coalesced in the eventfd.
+    dock_motion_subscribed.store(1, std::memory_order_release);
+    return true;
 }
 
 void run_dock_motion() {
     const int event = dock_motion_event;
     if (event < 0) return;
+    constexpr int kPollMs = 1000;
+    constexpr uint64_t kKeepAliveNs = 5000000000ULL;
+    constexpr uint64_t kSuspendGapNs = 5000000000ULL;
     unsigned reconnects = 0;
     bool unavailable_reported = false;
     for (;;) {
         WindowBinderTransport transport;
         Sample sample{};
         if (!transport.connect() || !current_sample(sample) || !transport.send(sample)) {
-            dock_motion_subscribed.store(0, std::memory_order_release);
             if (!unavailable_reported) {
                 __android_log_print(ANDROID_LOG_WARN, kTag,
                     "motion Binder transport unavailable; retrying in background");
@@ -149,33 +167,85 @@ void run_dock_motion() {
         }
 
         unavailable_reported = false;
-        dock_motion_subscribed.store(1, std::memory_order_release);
         __android_log_print(ANDROID_LOG_INFO, kTag,
-            "motion v20 ready: native scale/edit over authenticated IWindowManager Binder reconnect=%u",
+        "motion v25 ready: native scale/edit with suspend-aware Binder recovery reconnect=%u",
             reconnects);
 
         bool disconnected = false;
+        uint64_t last_value = sample.value;
+        uint64_t last_edit_state = sample.edit_state;
+        uint64_t last_sent_ns = sample.uptime_ns;
+        uint64_t last_boot_ns = 0;
+        uint64_t last_mono_ns = 0;
+        if (!clock_ns(CLOCK_BOOTTIME, last_boot_ns)
+            || !clock_ns(CLOCK_MONOTONIC, last_mono_ns)) break;
+        bool resumed = false;
         while (!disconnected) {
             pollfd descriptor{event, POLLIN, 0};
             int result;
             do {
-                result = poll(&descriptor, 1, -1);
+                result = poll(&descriptor, 1, kPollMs);
             } while (result < 0 && errno == EINTR);
-            if (result <= 0 || !(descriptor.revents & POLLIN)) {
+            if (result < 0) {
                 disconnected = true;
                 continue;
             }
-            eventfd_t count = 0;
-            disconnected = eventfd_read(event, &count) != 0
-                || !current_sample(sample) || !transport.send(sample);
+            uint64_t boot_ns = 0;
+            uint64_t mono_ns = 0;
+            if (!clock_ns(CLOCK_BOOTTIME, boot_ns)
+                || !clock_ns(CLOCK_MONOTONIC, mono_ns)) {
+                disconnected = true;
+                continue;
+            }
+            // Both clocks advance while this worker is merely descheduled or frozen.
+            // Only CLOCK_BOOTTIME advances through device suspend, so compare their
+            // deltas instead of treating any long scheduling gap as a screen resume.
+            const uint64_t boot_delta = boot_ns >= last_boot_ns
+                ? boot_ns - last_boot_ns : UINT64_MAX;
+            const uint64_t mono_delta = mono_ns >= last_mono_ns
+                ? mono_ns - last_mono_ns : UINT64_MAX;
+            if (boot_delta == UINT64_MAX || mono_delta == UINT64_MAX
+                || (boot_delta > mono_delta && boot_delta - mono_delta > kSuspendGapNs)) {
+                resumed = true;
+                disconnected = true;
+                continue;
+            }
+            last_boot_ns = boot_ns;
+            last_mono_ns = mono_ns;
+            if (descriptor.revents & POLLIN) {
+                eventfd_t count = 0;
+                if (eventfd_read(event, &count) != 0) {
+                    disconnected = true;
+                    continue;
+                }
+            }
+            if (!current_sample(sample)) {
+                disconnected = true;
+                continue;
+            }
+            const bool changed = sample.value != last_value || sample.edit_state != last_edit_state;
+            const bool keep_alive = !changed
+                && (sample.uptime_ns - last_sent_ns) >= kKeepAliveNs;
+            if (changed || keep_alive) {
+                if (!transport.send(sample)) {
+                    disconnected = true;
+                    continue;
+                }
+                last_value = sample.value;
+                last_edit_state = sample.edit_state;
+                last_sent_ns = sample.uptime_ns;
+            }
         }
 
-        dock_motion_subscribed.store(0, std::memory_order_release);
+        if (resumed) {
+            __android_log_print(ANDROID_LOG_INFO, kTag,
+                "device resume detected; rebuilding motion Binder transport");
+        }
         if (reconnects < 3) {
             __android_log_print(ANDROID_LOG_WARN, kTag,
                 "motion Binder transport disconnected; reconnecting");
         }
         ++reconnects;
-        retry_delay();
+        if (!resumed) retry_delay();
     }
 }

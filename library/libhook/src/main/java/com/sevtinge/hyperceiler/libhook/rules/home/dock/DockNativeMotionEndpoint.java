@@ -11,8 +11,10 @@ import java.util.function.Consumer;
 
 /** Authenticated custom transaction carried by MiuiHome's existing IWindowManager Binder. */
 public final class DockNativeMotionEndpoint {
-    // Versioned once to bypass stale pre-v21 callbacks left in system_server by hot reload.
-    public static final int TRANSACTION_CODE = 0x00484345;
+    // Versioned to bypass the already-loaded short-circuiting v21 callback. From v22 onward
+    // every callback restores the Parcel and yields, so future hot reloads share this code.
+    public static final int TRANSACTION_CODE = 0x00484346;
+    public static final int ACK = 0x48434B32;
     private static final String DESCRIPTOR = "android.view.IWindowManager";
 
     private record Identity(int uid, int pid) { }
@@ -76,7 +78,7 @@ public final class DockNativeMotionEndpoint {
             report(16, "native motion Binder rejected: payload bytes=" + available);
             return true;
         }
-        boolean identityMatches = expected != null && expected.equals(caller);
+        boolean identityMatches = expected != null && expected.uid() == callerUid;
         DockNativeMotion.Sample sample = DockNativeMotion.validate(
             data.readLong(), data.readLong(), data.readLong(), data.readLong(),
             identityMatches && current.sample() != null ? current.sample().sequence() : 0,
@@ -140,7 +142,7 @@ public final class DockNativeMotionEndpoint {
         Identity expected = current.identity();
         DockNativeMotion.Sample sample = current.sample();
         long now = System.nanoTime();
-        return expected != null && expected.uid() == uid && expected.pid() == pid
+        return expected != null && expected.uid() == uid
                 && sample != null && sample.uptimeNanos() <= now
                 && now - sample.uptimeNanos() <= DockNativeMotion.MAX_AGE_NS ? sample : null;
     }

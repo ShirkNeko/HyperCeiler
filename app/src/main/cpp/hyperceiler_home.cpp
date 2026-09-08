@@ -224,7 +224,7 @@ NativeOnModuleLoaded native_init(const NativeApiEntries *entries) {
     if (entries == nullptr || entries->hook_func == nullptr) return nullptr;
     const bool spawner = is_hyos_spawner_process();
     __android_log_print(ANDROID_LOG_INFO, kLogTag,
-        "native v20 hook API version=%u hyosSpawner=%d launcher=%d",
+        "native v25 hook API version=%u hyosSpawner=%d launcher=%d",
         entries->version, spawner, is_launcher_process());
     g_hook_function = entries->hook_func;
     // Install before libapp_launcher/libapp run their static initialization and cache the

@@ -3,7 +3,7 @@ package com.sevtinge.hyperceiler.libhook.rules.home.dock;
 
 /** Pure Binder-sample/scene policy. No Android dependencies and no log-derived animation. */
 public final class DockNativeMotion {
-    public static final long MAX_AGE_NS = 150_000_000L;
+    public static final long MAX_AGE_NS = 500_000_000L;
     private long sequence;
     private boolean recents;
     private float progress;

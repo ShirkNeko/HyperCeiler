@@ -31,7 +31,7 @@ static_assert(std::atomic<uint32_t>::is_always_lock_free && sizeof(std::atomic<u
 
 namespace {
 constexpr char kTag[] = "HyperCeiler.DockNative";
-constexpr transaction_code_t kMotionTransaction = 0x00484344;
+constexpr transaction_code_t kMotionTransaction = 0x00484345;
 constexpr char kWindowDescriptor[] = "android.view.IWindowManager";
 std::atomic<uint64_t> motion_sequence{0};
 
@@ -151,7 +151,7 @@ void run_dock_motion() {
         unavailable_reported = false;
         dock_motion_subscribed.store(1, std::memory_order_release);
         __android_log_print(ANDROID_LOG_INFO, kTag,
-            "motion v19 ready: native scale/edit over authenticated IWindowManager Binder reconnect=%u",
+            "motion v20 ready: native scale/edit over authenticated IWindowManager Binder reconnect=%u",
             reconnects);
 
         bool disconnected = false;

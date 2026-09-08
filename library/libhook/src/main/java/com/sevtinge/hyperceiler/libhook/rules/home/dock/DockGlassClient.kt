@@ -36,6 +36,7 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
         var consecutiveFailures = 0
         var recoveryPending = false
         var client: ContentProviderClient? = null
+        var refreshes = 0
 
         fun request(method: String, args: Bundle? = null): Bundle {
             // Keep an UNSTABLE reference for the lifetime of the active windowless host,
@@ -219,6 +220,25 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
                 recover(ticket, "surface attachment failed: ${it.javaClass.simpleName}")
             }
         }
+    }
+
+    /** Refresh only HyperCeiler's own windowless View after its parent becomes visible again. */
+    fun refresh(ticket: Ticket) {
+        // The parent's show is part of WMS's sync transaction. Refresh after that
+        // transaction has had several display frames to commit, not while still hidden.
+        worker.postDelayed(refresh@{
+            if (closed || ticket.cancelled || ticket.dead || ticket.lease == null) return@refresh
+            runCatching {
+                val response = ticket.request("dock_glass_refresh")
+                response.getString("error")?.let { error(it) }
+                ticket.refreshes++
+                if (ticket.refreshes <= 8) {
+                    record("glass background refresh id=${ticket.id} count=${ticket.refreshes}")
+                }
+            }.onFailure {
+                recover(ticket, "refresh ${it.javaClass.simpleName}: ${it.message?.take(160)}")
+            }
+        }, 50)
     }
 
     private fun recover(ticket: Ticket, reason: String) {

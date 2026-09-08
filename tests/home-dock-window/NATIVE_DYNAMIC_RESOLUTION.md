@@ -1,4 +1,4 @@
-# OS4 native motion v18: dynamic resolution and reconnect
+# OS4 Dock v20: dynamic motion/edit resolution and reconnect
 
 The production observer no longer has a launcher Build ID/address table, fixed
 class IDs, or fixed launcher payload offsets. The old probe and profile-only
@@ -14,7 +14,8 @@ tests were removed (recoverable from Git history).
 2. Match reviewed ARM64 instruction shapes after masking branch displacements,
    pool/field operands and materialized immediates. These are compiler shapes,
    not offsets from a library base. Unknown shapes remain unsupported.
-3. Require unique scene, setter, parameter-string and factory matches. The scale
+3. Require unique scene, setter, parameter-string, factory and EditMode callback
+   matches. The scale
    callback has two shape matches in the known artifacts: disambiguate through
    its two BL targets and the setter's receiver-field accesses.
 4. Decode class allocation tags and field accesses, then independently check
@@ -31,10 +32,11 @@ review, not speculative memory reads. Structure fingerprints are locators,
 not cryptographic authenticity checks.
 
 Failure retains the existing wallpaper-command animation fallback. A scene-0 sample
-cannot initiate motion, but OS4's transient scene-0 samples no longer clear an
-already authenticated recents drag while its scale remains below 1. The latch is
-cleared at the home endpoint or by the return scene. Latest-sample policy and the
-glass rendering preset are unchanged.
+cannot initiate motion by itself, but a verified window-scoped overview target can
+bridge a transient native scene gap while native scale remains in the recents band.
+An expiry frame returns from the last native position if samples stop after overview
+exit. Edit visibility uses the dynamically resolved EditMode state callback; the old
+wallpaper-scale/time heuristic has been removed.
 
 LSPosed initializes the module's native entry in `/system_ext/bin/hyos_spawner`
 (currently named `usap64`) before it forks MiuiHome. Version 17 hooks the spawner's
@@ -53,6 +55,11 @@ monotonic timestamp, age, scene and scale, then applies the latest value on the 
 frame clock. The previous system_server-to-launcher Unix socket was blocked by
 SELinux and has been removed.
 
+If a new launcher PID publishes before its WindowState is prepared, WMS retains the
+sample without applying it and promotes it only after the exact UID/PID is independently
+bound. This closes the launcher-restart race without trusting package data from the
+payload.
+
 The detached sender recreates its `IWindowManager` handle and retries every 500ms
 after a transaction failure. This covers the temporary endpoint loss caused by a
 module install/hot reload without polling while connected or touching the launcher
@@ -60,7 +67,7 @@ render thread. Only the first unavailable interval and first three disconnects a
 logged; each successful connection immediately publishes the latest sample before
 waiting on eventfd again.
 
-## Verification (2026-09-05)
+## Verification (2026-09-08)
 
 - Artifact resolver passed against both launcher 6179 and 6236, discovering
   their different function locations and parameter class IDs (1773 and 1777).
@@ -73,8 +80,12 @@ waiting on eventfd again.
   phone using HyperCeiler-only synthetic fixtures. Registers x0-x15, NZCV,
   Dart stack, unchanged fixtures, scene guards, eventfd notifications and
   alternate class IDs/field layouts passed. Temporary phone files were removed.
-- This is NOT a live launcher synchronization/visual test. No launcher restart,
-  phone reboot or other app's data mutation was performed for this verification.
+- Launcher 6236 resolved the v20 native hooks at runtime. Device diagnostics then
+  confirmed exact EditState transitions (`state=4` hidden, `state=2` shown) and
+  per-frame native-vsync motion. Java diagnostic v21 removes the superseded wallpaper
+  edit inference, adds cold-return refresh/expiry safeguards, and versions the private
+  Binder transaction once so callbacks left by pre-v21 hot reloads cannot consume the
+  current stream. Cleaned-up v21 callbacks explicitly yield to their successor.
 
 Host artifact test (pass paths to extracted ELF files, not APKs):
 

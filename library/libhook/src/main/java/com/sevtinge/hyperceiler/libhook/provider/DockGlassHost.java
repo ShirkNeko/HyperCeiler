@@ -101,6 +101,7 @@ final class DockGlassHost {
                 case "dock_glass_diagnostics" -> result.complete(diagnostics());
                 case "dock_glass_create" -> create(context, id, args, result);
                 case "dock_glass_status" -> result.complete(status(id));
+                case "dock_glass_refresh" -> result.complete(refresh(id));
                 case "dock_glass_release" -> { release(id); result.complete(Bundle.EMPTY); }
                 default -> throw new IllegalArgumentException("Unknown glass operation");
             }
@@ -272,6 +273,24 @@ final class DockGlassHost {
         result.putBoolean("backgroundReady", ready);
         result.putLong("textureTimestamp", timestamp);
         record(id, "backgroundReady=" + ready + ", textureTimestamp=" + timestamp);
+        return result;
+    }
+
+    private Bundle refresh(String id) throws Exception {
+        Entry entry = entries.get(id);
+        if (entry == null || !entry.view.isAttachedToWindow()) {
+            throw new IllegalStateException("Dock glass host is not attached");
+        }
+        // A hidden launcher parent can stop the vendor pass-window texture producer.
+        // Reassert the idempotent flag and schedule a fresh HWUI frame when the owned
+        // Dock parent becomes visible again. Never toggle a global blur setting.
+        if (!enableOwnBackground(entry.backdrop)) {
+            throw new IllegalStateException("Cross-window background refresh was rejected");
+        }
+        entry.backdrop.invalidate();
+        entry.view.invalidate();
+        Bundle result = new Bundle();
+        result.putBoolean("refreshed", true);
         return result;
     }
 

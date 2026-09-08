@@ -102,6 +102,7 @@ class HomeDockWindow : BaseHook() {
         var nativeApplied: Boolean = false, var overview: Boolean = false, var editMode: Boolean = false,
         var nativeEditState: Int = -1,
         var nativeScene: Int = -1,
+        var lastVisible: Boolean? = null,
         var lastGlassReady: Boolean? = null,
         var motionSession: Any? = null, var motionClient: IBinder? = null,
         var motionSamples: Int = 0, var motionEndPending: Boolean = false,
@@ -111,14 +112,6 @@ class HomeDockWindow : BaseHook() {
     private val observed = HashSet<String>()
     @Volatile private var stopped = false
     @Volatile private var settings = Settings.read()
-    // Wallpaper-command editMode tracking: supplements native editState when the
-    // native hook doesn't fire (e.g. long-press on desktop background).
-    private var wallpaperEditMode = false
-    private var wallpaperEditModePending = false
-    private var wallpaperEditModePendingAt = 0L
-    private var wallpaperEditModeExitPending = false
-    private var wallpaperEditModeExitAt = 0L
-    private var lastWallpaperScale = 1.0
     @Volatile private var service: Any? = null
     private var blurAvailable = true
     private var commandSamples = 0
@@ -141,7 +134,7 @@ class HomeDockWindow : BaseHook() {
     }
 
     override fun init() {
-        glassClient.record("hook init diagnosticVersion=19 enabled=${settings.enabled} mode=${settings.mode}")
+        glassClient.record("hook init diagnosticVersion=21 enabled=${settings.enabled} mode=${settings.mode}")
         runCatching { processGuard.install() }
             .onFailure { glassClient.record("renderer guard unavailable=${it.javaClass.simpleName}") }
         val prefs = PrefsBridge.getSharedPreferences()
@@ -190,6 +183,10 @@ class HomeDockWindow : BaseHook() {
                 stub.getDeclaredMethod("onTransact", Integer.TYPE, Parcel::class.java,
                     Parcel::class.java, Integer.TYPE).apply { isAccessible = true }
                     .createBeforeHook { param ->
+                        // A hot reload cannot physically remove callbacks already registered in
+                        // system_server. Let the newest hook handle this private transaction after
+                        // cleanup instead of consuming native frames in a stale endpoint.
+                        if (stopped) return@createBeforeHook
                         val code = param.args[0] as Int
                         if (code != DockNativeMotionEndpoint.TRANSACTION_CODE) return@createBeforeHook
                         val handled = runCatching {
@@ -269,43 +266,6 @@ class HomeDockWindow : BaseHook() {
                     @Suppress("DEPRECATION")
                     val scale = (extras.get("scale_to") as? Number)?.toDouble() ?: return
                     val isSetTo = extras.getString("action") == "setTo"
-                    val layer = layers[window]
-                    // Detect editMode from wallpaper command scale values.
-                    // The native edit hook doesn't fire for long-press on desktop
-                    // (only for pinch gesture). Use wallpaper commands as fallback.
-                    //
-                    // Entry signals: setTo(>1.1) — the launcher sends this when
-                    // long-pressing the desktop background to enter edit mode.
-                    // Also startAnim(>1.05) for drag/animation entries.
-                    //
-                    // Exit signal: startAnim(≤1.05) — but this also fires during
-                    // drag transitions, so EXIT IS DEFERRED by 500ms. If another
-                    // entry signal arrives within that window, exit is cancelled.
-                    if (layer != null) {
-                        if (scale > 1.1 && isSetTo) {
-                            // setTo with large scale — possible edit mode entry.
-                            // Defer by 500ms: if startAnim(1.05) follows within that
-                            // window, it's a wallpaper change / exit sequence, not entry.
-                            wallpaperEditModePending = true
-                            wallpaperEditModePendingAt = SystemClock.uptimeMillis()
-                            wallpaperEditModeExitPending = false
-                        } else if (scale > 1.06 && !isSetTo && !wallpaperEditMode) {
-                            // startAnim with large scale — possible drag entry.
-                            // Also defer by 500ms.
-                            wallpaperEditModePending = true
-                            wallpaperEditModePendingAt = SystemClock.uptimeMillis()
-                            wallpaperEditModeExitPending = false
-                        } else if (scale <= 1.06 && !isSetTo) {
-                            // startAnim to normal scale — cancels pending entry,
-                            // or defers exit if already in edit mode.
-                            wallpaperEditModePending = false
-                            if (wallpaperEditMode) {
-                                wallpaperEditModeExitPending = true
-                                wallpaperEditModeExitAt = SystemClock.uptimeMillis()
-                            }
-                        }
-                    }
-                    lastWallpaperScale = scale
                     val overview = DockRecentsMotion.overviewTarget(param.args[1] as String,
                         extras.getString("action"), scale) ?: return
                     updateOverview(window, overview, isSetTo, scale)
@@ -331,26 +291,17 @@ class HomeDockWindow : BaseHook() {
             val layer = layers[window] ?: return
             layer.overview = overview
             val now = SystemClock.uptimeMillis()
-            // Resolve deferred wallpaper editMode entry: if 500ms passed since
-            // setTo(>1.1) without a startAnim(1.05) cancelling it, confirm entry.
-            if (wallpaperEditModePending && !wallpaperEditMode
-                && now - wallpaperEditModePendingAt > 500) {
-                wallpaperEditMode = true
-                wallpaperEditModePending = false
-                setEditMode(layer, true, "wallpaper entry confirmed after 500ms")
-            }
-            // Resolve deferred wallpaper editMode exit.
-            if (wallpaperEditModeExitPending && wallpaperEditMode
-                && now - wallpaperEditModeExitAt > 500) {
-                wallpaperEditMode = false
-                wallpaperEditModeExitPending = false
-                setEditMode(layer, false, "wallpaper exit confirmed after 500ms")
-            }
             layer.motionTime = now
             val wasRunning = layer.motion.isRunning(now)
             val targetChanged = layer.motion.setOverview(overview, now)
             if (immediate) layer.motion.finish()
-            if (nativeMotionEndpoint.latest(layer.nativeUid, layer.nativePid) != null) return
+            if (nativeMotionEndpoint.latest(layer.nativeUid, layer.nativePid) != null) {
+                if (targetChanged || (immediate && wasRunning)) {
+                    scheduleAnimationFrame()
+                    scheduleNativeExpiryCheck()
+                }
+                return
+            }
             if (targetChanged || (immediate && wasRunning)) {
                 layer.motionSamples = 0
                 layer.motionEndPending = true
@@ -388,9 +339,11 @@ class HomeDockWindow : BaseHook() {
             }
             val windowVisible = window.callMethod("isVisible") == true
             val visible = windowVisible && !layer.editMode
-            bindNativeMotion(layer, visible)
+            bindNativeMotion(layer)
             if (!visible || !animationAvailable) layer.motion.finish()
             val glass = updateGlass(layer, config, bounds, dark, visible)
+            if (visible && layer.lastVisible == false && glass != null) glassClient.refresh(glass)
+            layer.lastVisible = visible
             val appearance = Appearance(config, bounds, dark, visible, glass)
             val now = SystemClock.uptimeMillis()
 
@@ -604,7 +557,7 @@ class HomeDockWindow : BaseHook() {
         }
     }
 
-    private fun bindNativeMotion(layer: Layer, visible: Boolean) {
+    private fun bindNativeMotion(layer: Layer) {
         // Bind the Binder identity eagerly so early samples are never lost.
         // The native transport starts sending as soon as hooks are installed,
         // which may precede the first prepareSurfaces where the window is visible.
@@ -623,7 +576,6 @@ class HomeDockWindow : BaseHook() {
                 glassClient.record("native motion identity unavailable=${it.javaClass.simpleName}")
             }
         }
-        if (!visible) return
     }
 
     // Called only under the layer lock. The authenticated Binder receiver publishes an
@@ -633,38 +585,32 @@ class HomeDockWindow : BaseHook() {
         if (sample != null) {
             if (sample.editState() != layer.nativeEditState) {
                 layer.nativeEditState = sample.editState()
-                wallpaperEditMode = false  // Native state supersedes wallpaper fallback.
                 sample.editHidden()?.let {
                     setEditMode(layer, it, "native state=${sample.editState()}")
                 }
             }
-            layer.nativeMotion.accept(sample)
+            layer.nativeMotion.accept(sample, layer.overview)
             layer.nativeApplied = true
             if (sample.scene() != layer.nativeScene) {
                 layer.nativeScene = sample.scene()
                 layer.motionSamples = 0
                 layer.motionEndPending = true
                 glassClient.record("native motion scene=${sample.scene()} scale=${sample.scale()}")
-                // Recents (1) or home-return (2) means the user is swiping, not editing.
-                // Clear any wallpaper-derived editMode immediately.
-                if (sample.scene() != 0) {
-                    wallpaperEditModePending = false
-                    if (wallpaperEditMode) {
-                        wallpaperEditMode = false
-                        wallpaperEditModeExitPending = false
-                        setEditMode(layer, false, "native scene=${sample.scene()}")
-                    }
-                }
             }
             return layer.nativeMotion.offsetY(layer.density, layer.baseY)
         }
         if (layer.nativeApplied) {
-            // Native samples stopped arriving. This can happen when:
-            //  1. The launcher restarted (identity changed, new pid not yet sending)
-            //  2. The native hooks were unloaded
-            // Keep the last known native offset; do not reset to scene-based motion.
-            // When a new sample arrives from the restarted launcher, native resumes.
-            return layer.nativeMotion.offsetY(layer.density, layer.baseY)
+            // A held recents gesture legitimately produces no changing scale samples.
+            // Once the verified overview target has cleared, resume the local return
+            // curve from the exact native position instead of freezing or snapping.
+            if (layer.overview) return layer.nativeMotion.offsetY(layer.density, layer.baseY)
+            layer.motion.resumeFrom(layer.nativeMotion.progress(), false, now)
+            layer.nativeApplied = false
+            layer.nativeMotion.reset()
+            layer.nativeScene = -1
+            layer.motionSamples = 0
+            layer.motionEndPending = true
+            glassClient.record("native motion idle after overview exit; resuming return")
         }
         return layer.motion.offsetY(layer.density, layer.baseY, now)
     }
@@ -693,6 +639,14 @@ class HomeDockWindow : BaseHook() {
                 requestTraversal()
             }
         }
+    }
+
+    private fun scheduleNativeExpiryCheck() {
+        val wm = service ?: return
+        val delay = DockNativeMotion.MAX_AGE_NS / 1_000_000L + 16L
+        wm.getObjectFieldAs<Handler>(WM_HANDLER).postDelayed({
+            if (!stopped) scheduleAnimationFrame()
+        }, delay)
     }
 
     private fun failClosed(error: Throwable) {

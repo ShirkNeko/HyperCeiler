@@ -69,6 +69,14 @@ not alter a static whitelist and does not intercept direct force-stop, swipe-kil
 thermal, idle, lock-screen or other cleanup policies. This retains the live glass
 buffer through the recents clear instead of merely shortening its reconstruction.
 
+Version 20 also handles launcher-parent visibility transitions. Returning from a
+cold-started application reasserts pass-window blur and invalidates only HyperCeiler's
+own windowless glass views after allowing several display frames for the WMS show
+transaction. The Surface
+package is retained, so this refresh neither accumulates layers nor flashes through a
+renderer recreation. Wallpaper scale is no longer allowed to hide the Dock as a
+guessed edit-mode signal.
+
 ## Follow-up verification
 
 1. With glass visible, confirm one bound DockGlassRenderService, one host root,

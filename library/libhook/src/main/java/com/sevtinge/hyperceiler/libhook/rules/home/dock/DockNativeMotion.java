@@ -14,7 +14,7 @@ public final class DockNativeMotion {
             return switch (editState) {
                 case 0 -> null;
                 // Encoded enum indices: disabled=1, normal=2, shortcutMenu=7.
-                case 1, 2 -> false;
+                case 1, 2, 7 -> false;
                 // quick, multiselect, pinchingIn/out and preview are editing UI.
                 case 3, 4, 5, 6, 8 -> true;
                 default -> null;
@@ -33,13 +33,15 @@ public final class DockNativeMotion {
         return new Sample(sequence, timestamp, scene, scale, (int) editState);
     }
 
-    public boolean accept(Sample sample) {
+    public boolean accept(Sample sample, boolean overviewHint) {
         if (sample == null || sample.sequence() <= sequence) return false;
         sequence = sample.sequence();
         if (sample.scene() == 1) recents = true;
-        else if (sample.scene() == 0 && (!recents || sample.scale() >= .999999)) recents = false;
+        else if (overviewHint && sample.scale() < .999999 && sample.scale() >= .90) recents = true;
+        else if (sample.scene() == 0
+                && (!recents || sample.scale() >= .999999 || sample.scale() < .90)) recents = false;
         // OS4 briefly publishes scene 0 while an already-authenticated recents
-        // drag is still below scale 1, then resumes scene 1. Preserve that latch
+        // drag is still in the recents scale band, then resumes scene 1. Preserve that latch
         // instead of snapping to the default position. Scene 0 can never start
         // a lift by itself, and scale 1 still terminates it.
         // A folder/app returning to scale 1 cannot start a recents animation.
@@ -50,6 +52,8 @@ public final class DockNativeMotion {
         }
         return true;
     }
+
+    public boolean accept(Sample sample) { return accept(sample, false); }
 
     public float progress() { return progress; }
     public float offsetY(float density, int baseY) {

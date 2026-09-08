@@ -1,7 +1,7 @@
 # HyperOS 4 Dock window regression checks
 
-Current native implementation: [v18 dynamic resolution, verification, and Binder reconnect](NATIVE_DYNAMIC_RESOLUTION.md).
-Java hook diagnostic version 16 additionally fixes remote glass surface lifetime and
+Current native implementation: [v20 dynamic motion/edit resolution, verification, and Binder reconnect](NATIVE_DYNAMIC_RESOLUTION.md).
+Java hook diagnostic version 21 additionally fixes remote glass surface lifetime and
 immediate recovery after a live renderer is force-stopped:
 attach and detach are serialized on the IPC worker, never deferred in WMS's sync
 transaction. Each generation is explicitly reparented to null before releasing

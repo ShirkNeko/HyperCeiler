@@ -115,7 +115,7 @@ void *motion_worker(void *) {
         return nullptr;
     }
     __android_log_print(ANDROID_LOG_INFO, kTag,
-        "dynamic motion v19 resolved: paramsCID=%u doubleCID=%u edit=dynamic",
+        "dynamic motion v20 resolved: paramsCID=%u doubleCID=%u edit=dynamic",
         resolved.layout.params_class_id, resolved.layout.double_class_id);
     run_dock_motion();
     return nullptr;

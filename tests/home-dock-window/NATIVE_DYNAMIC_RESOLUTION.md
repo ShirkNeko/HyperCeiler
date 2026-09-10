@@ -1,47 +1,66 @@
-# OS4 Dock v25: dynamic motion resolution and suspend-aware reconnect
+# OS4 Dock v31: semantic dynamic resolution and concurrent runtime recovery
 
-The transport distinguishes actual device suspend from ordinary process scheduling by
-comparing `CLOCK_BOOTTIME` and `CLOCK_MONOTONIC` deltas. A long launcher scheduling or
-freezer gap advances both clocks and no longer tears down a healthy Binder channel.
+The permanent nonblocking eventfd coalesces the newest sample while Binder reconnects.
+The transport reconnects after either a transaction failure or a real suspend gap found
+by comparing `CLOCK_BOOTTIME` and `CLOCK_MONOTONIC`. Its five-second health packet does
+not refresh an older published motion sample; it only validates transport and preheats
+the system-side frame channel.
 
-The production observer no longer has a launcher Build ID/address table, fixed
-class IDs, or fixed launcher payload offsets. The old probe and profile-only
-tests were removed (recoverable from Git history).
+The native hook manager verifies target mapping identity and patch bytes in the
+background. A complete executable-mapping inventory change or an explicit recovery
+request triggers a fresh semantic scan. Every independently mapped runtime is grouped by
+file identity and load bias, resolved on its own, and installed into an immutable symbol/
+trampoline bank. Old and new generations stay hooked concurrently; a newly mapped idle
+runtime can no longer steal the only trampoline from the active UI runtime. Banks are
+never reused in the same process, so a delayed callback can never observe another
+generation's layout or original trampoline.
+The system-side frame channel uses an owned Choreographer when OS4 exposes it. A real
+motion sample detects a frame request stranded across suspend using elapsed realtime and
+immediately replaces it. Transient SurfaceControl or Choreographer failures rebuild the
+cached transaction and frame clock with bounded backoff.
+
+The production observer has no launcher Build ID/address table, function address,
+file offset, whole-function fingerprint, fixed class ID or launcher payload offset.
+It intentionally retains bounded ARM64 compiler idioms and register/data-flow
+relationships as semantic contracts. The old probe and profile-only tables were
+removed (recoverable from Git history).
 
 ## Resolution and safety boundary
 
-1. Find `libapp.so` with `dl_iterate_phdr`, accepting only bounded, readable and
-   executable PT_LOAD ranges. HYOS can map AOT code outside the linker's image
-   list, so a bounded fallback reads only this process's explicit executable
-   `/libapp.so` mappings from `/proc/self/maps`. It never scans writable,
+1. Parse only this process's explicit, file-backed, non-writable executable
+   `/libapp.so` mappings from `/proc/self/maps`, including a retained `(deleted)`
+   generation. Code is copied with a fault-reporting own-process read and the
+   mapping inventory is checked again afterward. It never scans writable,
    anonymous, heap, or another process's memory.
-2. Match reviewed ARM64 instruction shapes after masking branch displacements,
-   pool/field operands and materialized immediates. These are compiler shapes,
-   not offsets from a library base. Unknown shapes remain unsupported.
-3. Require unique scene, setter, parameter-string and factory matches. The scale
-   callback has two shape matches in the known artifacts: disambiguate through
-   its two BL targets and the setter's receiver-field accesses. EditMode is an
-   optional, independently verified observer; a changed edit closure cannot disable
-   the real-time recents path.
-4. Decode class allocation tags and field accesses, then independently check
-   constructor stores against parameter/setter reads. Require aligned fields
-   inside the decoded allocation size. Invalid or ambiguous input fails closed.
-5. Publish the derived layout once, before installing callbacks. Assembly uses
-   that immutable layout and does not retain or modify Dart heap pointers.
+2. Decode ARM64 opcodes and register/data-flow roles. Locate the parameter
+   constructor through its allocation, scalar stores, paired scale stores and
+   canonical-bool initialization. Locate the per-frame callback through its two
+   calls to one setter, then locate `setTo` through three boxed-double transfers
+   using that same setter.
+3. Resolve `animateTo` by its dynamically shared generated prelude with `setTo`,
+   then require its continuation cluster to use the constructor-derived alpha,
+   scale/scaleY fields and boxed-double allocation tag. No saved instruction
+   launcher address, file offset or whole-function hash participates in selection.
+4. Decode the object-header offset, class-ID bit range, object-size bit range,
+   allocation tags, bool singleton displacement and every payload field from the
+   current process's instructions. Independently corroborate constructor, setter,
+   callback and continuation relationships. Invalid, changed or ambiguous code
+   fails closed.
+5. Publish each generation's derived values through its own independently relocated
+   module symbols before installing callbacks. Assembly has no launcher address or
+   payload offset constants and does not retain or modify Dart heap pointers.
 
-The remaining ARM64/Dart constants describe the calling convention, tagged
-header, class-tag encoding and bool singleton ABI, not a launcher build's memory
-addresses. Layout-handoff macros describe HyperCeiler's own C++ struct and are
-checked using `offsetof` assertions. A different Dart ABI/compiler shape needs
-review, not speculative memory reads. Structure fingerprints are locators,
-not cryptographic authenticity checks.
+Only ARM64 opcode encodings and Dart calling registers remain compile-time
+contracts. They are instruction-set/calling-convention definitions, not launcher
+addresses or memory offsets. Edit-mode observation was removed because it had no
+equally strong relationship to the motion graph and would otherwise require a
+specific closure layout.
 
 Failure retains the existing wallpaper-command animation fallback. A scene-0 sample
 cannot initiate motion by itself, but a verified window-scoped overview target can
 bridge a transient native scene gap while native scale remains in the recents band.
 An expiry frame returns from the last native position if samples stop after overview
-exit. Edit visibility uses the dynamically resolved EditMode state callback; the old
-wallpaper-scale/time heuristic has been removed.
+exit. The former experimental EditMode visibility path is not part of native motion.
 
 LSPosed initializes the module's native entry in `/system_ext/bin/hyos_spawner`
 (currently named `usap64`) before it forks MiuiHome. Version 17 hooks the spawner's
@@ -70,30 +89,34 @@ after a transaction failure. This covers the temporary endpoint loss caused by a
 module install/hot reload without polling while connected or touching the launcher
 render thread. Only the first unavailable interval and first three disconnects are
 logged; each successful connection immediately publishes the latest sample before
-waiting on eventfd again.
+waiting on eventfd again. A semantic revalidation request remains acknowledged until
+the receiver observes a publish counter newer than the request baseline. While it is
+pending, the sender repeats the scan at a bounded one-second cadence; a transient or
+premature scan therefore cannot remain stuck until another overview gesture.
 
-## Verification (2026-09-08)
+## Verification (2026-09-10)
 
-- Artifact resolver passed against launcher 6179, 6236 and 6241, discovering
-  their function locations and parameter class IDs dynamically. Launcher 6241
-  deliberately contains two scale-shape candidates; setter call/field relationships
-  select the correct callback without a build address table.
-- Tests relocate executable ranges, mutate the parameter CID and all four
-  relevant field offsets, reject inconsistent accessors, duplicate matches,
-  missing required callbacks and empty input. Missing optional EditMode retains
-  motion resolution with edit observation disabled.
-- Eight Java policy tests pass, including packets, replay, fallback continuity,
-  background-mode migration, glass presets and endpoint ownership.
+- The v31 artifact resolver passes against launcher 6241 and dynamically discovers
+  `scale=e25740`, `animate=deecd4`, `set=e24488` and parameter CID 1777 from semantic
+  relationships. Multiple unrelated constructor and scale candidates are rejected
+  by their setter/continuation data flow.
+- Resolver/runtime tests relocate complete executable ranges, group independently
+  loaded generations, reject duplicate matches and malformed mapping inventories,
+  and pass AddressSanitizer plus UndefinedBehaviorSanitizer.
+- Nine Java policy tests pass, including packet replay/freshness, exact UID/PID
+  ownership, early PID rebinding, same-sample overview reinterpretation, fallback
+  continuity, background-mode migration and glass presets.
 - The production assembly was cross-compiled and executed on the connected
   phone using HyperCeiler-only synthetic fixtures. Registers x0-x15, NZCV,
-  Dart stack, unchanged fixtures, scene guards, eventfd notifications and
-  alternate class IDs/field layouts passed. Temporary phone files were removed.
-- Launcher 6236 resolved the v21 native hooks at runtime. Device diagnostics then
-  confirmed exact EditState transitions (`state=4` hidden, `state=2` shown) and
-  per-frame native-vsync motion. Java diagnostic v23 removes the superseded wallpaper
-  edit inference, adds cold-return refresh/expiry safeguards, and uses an acknowledged
-  private Binder transaction. Every active endpoint restores the input Parcel and yields
-  before the final reply, so callbacks retained by hot reload cannot starve their successor.
+  Dart stack, unchanged fixtures, scene guards and eventfd notifications passed.
+  A second fixture changed the class-ID bit shift, mask, tagged-header offset,
+  bool-singleton displacement, class IDs and every payload field without changing
+  assembly. It uses a second immutable runtime bank and verifies the first bank still
+  works afterward. Temporary phone files were removed.
+- The acknowledged versioned Binder payload carries transport sequence, monotonic
+  timestamp, packed scene/scale, entry count and publish count. Every active endpoint
+  restores the input Parcel and yields before the final reply, so callbacks retained by
+  hot reload cannot starve their successor.
 
 Host artifact test (pass paths to extracted ELF files, not APKs):
 

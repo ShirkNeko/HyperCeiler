@@ -62,6 +62,10 @@ final class DockGlassHost {
     }
 
     Bundle call(Context context, String method, String id, Bundle args) {
+        if ("dock_glass_native_record".equals(method)) {
+            checkLauncherRecorder(context);
+            return DockDiagnosticJournal.access(context, args);
+        }
         checkCaller(method);
         return switch (method) {
             case "dock_glass_history" -> DockDiagnosticJournal.access(context, null);
@@ -69,6 +73,17 @@ final class DockGlassHost {
             case "dock_glass_self_test" -> selfTest(context);
             default -> callHost(context, method, id, args);
         };
+    }
+
+    private static void checkLauncherRecorder(Context context) {
+        int uid = Binder.getCallingUid();
+        try {
+            if (uid != context.getPackageManager().getPackageUid("com.miui.home", 0)) {
+                throw new SecurityException("Only the system launcher may record native status");
+            }
+        } catch (android.content.pm.PackageManager.NameNotFoundException error) {
+            throw new SecurityException("System launcher identity is unavailable", error);
+        }
     }
 
     private static void checkCaller(String method) {

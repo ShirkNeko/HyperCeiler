@@ -7,35 +7,49 @@ public final class DockNativeMotion {
     private long sequence;
     private boolean recents;
     private float progress;
+    private Sample lastSample;
+    private boolean lastOverviewHint;
     public record Sample(long sequence, long uptimeNanos, int scene, double scale,
-                         int editState) {
-        /** null until native EditMode has published its first state. */
-        public Boolean editHidden() {
-            return switch (editState) {
-                case 0 -> null;
-                // Encoded enum indices: disabled=1, normal=2, shortcutMenu=7.
-                case 1, 2, 7 -> false;
-                // quick, multiselect, pinchingIn/out and preview are editing UI.
-                case 3, 4, 5, 6, 8 -> true;
-                default -> null;
-            };
-        }
-    }
+                         long entryHits, long publishHits) { }
 
-    public static Sample validate(long sequence, long timestamp, long packed, long editState,
+    public static Sample validate(long sequence, long timestamp, long packed,
+                                  long entryHits, long publishHits,
                                   long previousSequence, long nowNanos) {
         int scene = (int) (packed & 3);
         double scale = Double.longBitsToDouble(packed & ~3L);
         if (sequence <= previousSequence || timestamp < 0 || timestamp > nowNanos
                 || nowNanos - timestamp > MAX_AGE_NS || scene > 2
-                || !Double.isFinite(scale) || scale < 0 || scale > 2
-                || editState < 0 || editState > 8) return null;
-        return new Sample(sequence, timestamp, scene, scale, (int) editState);
+                || entryHits < 0 || publishHits < 0 || publishHits > entryHits
+                || !Double.isFinite(scale) || scale < 0 || scale > 2) return null;
+        return new Sample(sequence, timestamp, scene, scale, entryHits, publishHits);
+    }
+
+    /** Keepalive/entry-only packets advance transport replay state, never motion freshness. */
+    public static boolean hasPublishedProgress(Sample previous, Sample incoming) {
+        if (incoming == null) return false;
+        if (previous == null) return incoming.publishHits() > 0;
+        if (incoming.entryHits() < previous.entryHits()
+                || incoming.publishHits() < previous.publishHits()) return false;
+        return incoming.publishHits() > previous.publishHits()
+                || incoming.scene() != previous.scene()
+                || Double.doubleToRawLongBits(incoming.scale())
+                    != Double.doubleToRawLongBits(previous.scale());
     }
 
     public boolean accept(Sample sample, boolean overviewHint) {
-        if (sample == null || sample.sequence() <= sequence) return false;
-        sequence = sample.sequence();
+        if (sample == null || sample.sequence() < sequence) return false;
+        if (sample.sequence() == sequence) {
+            // Native scale can arrive just before the authenticated wallpaper
+            // overview command. Replay protection must not prevent that same
+            // immutable sample from being reinterpreted once the hint becomes
+            // true, or a short first gesture remains at the default position.
+            if (lastSample == null || !lastSample.equals(sample)
+                    || lastOverviewHint || !overviewHint) return false;
+        } else {
+            sequence = sample.sequence();
+            lastSample = sample;
+        }
+        lastOverviewHint = overviewHint;
         if (sample.scene() == 1) recents = true;
         else if (overviewHint && sample.scale() < .999999 && sample.scale() >= .90) recents = true;
         else if (sample.scene() == 0
@@ -60,5 +74,11 @@ public final class DockNativeMotion {
         if (!Float.isFinite(density) || density <= 0 || baseY <= 0) return 0;
         return -Math.min(baseY, DockRecentsMotion.LIFT_DP * density * progress);
     }
-    public void reset() { sequence = 0; recents = false; progress = 0; }
+    public void reset() {
+        sequence = 0;
+        recents = false;
+        progress = 0;
+        lastSample = null;
+        lastOverviewHint = false;
+    }
 }

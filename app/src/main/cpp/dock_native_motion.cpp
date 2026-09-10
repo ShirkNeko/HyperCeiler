@@ -16,23 +16,21 @@ extern "C" {
 // Low two bits carry scene: 0=unrelated, 1=recents, 2=home return.
 // Removing two mantissa bits loses < 1e-15, well below a physical pixel.
 alignas(8) std::atomic<uint64_t> dock_motion_value{0x3ff0000000000000ULL};
-// 0=unknown; otherwise EditState enum index + 1 (indices 0..7).
-alignas(4) std::atomic<uint32_t> dock_edit_state{0};
+alignas(8) std::atomic<uint64_t> dock_motion_entry_hits{0};
+alignas(8) std::atomic<uint64_t> dock_motion_publish_hits{0};
+alignas(8) std::atomic<uint64_t> dock_motion_active_callbacks{0};
 alignas(4) std::atomic<uint32_t> dock_motion_subscribed{0};
 int dock_motion_event = -1;
 extern const uint64_t dock_motion_one = 1;
-void *dock_motion_scale_original = nullptr;
-void *dock_motion_anim_original = nullptr;
-void *dock_motion_set_original = nullptr;
-void *dock_edit_original = nullptr;
 }
 static_assert(std::atomic<uint64_t>::is_always_lock_free && sizeof(std::atomic<uint64_t>) == 8);
 static_assert(std::atomic<uint32_t>::is_always_lock_free && sizeof(std::atomic<uint32_t>) == 4);
 
 namespace {
 constexpr char kTag[] = "HyperCeiler.DockNative";
-constexpr transaction_code_t kMotionTransaction = 0x00484346;
+constexpr transaction_code_t kMotionTransaction = 0x0048434A;
 constexpr int32_t kMotionAck = 0x48434B32;
+constexpr int32_t kMotionAckRevalidate = 0x48434B33;
 constexpr char kWindowDescriptor[] = "android.view.IWindowManager";
 std::atomic<uint64_t> motion_sequence{0};
 
@@ -52,7 +50,8 @@ struct Sample {
     uint64_t sequence;
     uint64_t uptime_ns;
     uint64_t value;
-    uint64_t edit_state;
+    uint64_t entry_hits;
+    uint64_t publish_hits;
 };
 
 bool current_sample(Sample &sample) {
@@ -60,8 +59,16 @@ bool current_sample(Sample &sample) {
     if (!clock_ns(CLOCK_MONOTONIC, now)) return false;
     sample.sequence = motion_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
     sample.uptime_ns = now;
-    sample.value = dock_motion_value.load(std::memory_order_acquire);
-    sample.edit_state = dock_edit_state.load(std::memory_order_acquire);
+    // The replacement publishes packed motion before incrementing publishHits.
+    // Retry around that release sequence so a parcel never pairs a new counter
+    // with the preceding packed value.
+    uint64_t before;
+    do {
+        before = dock_motion_publish_hits.load(std::memory_order_acquire);
+        sample.value = dock_motion_value.load(std::memory_order_acquire);
+        sample.publish_hits = dock_motion_publish_hits.load(std::memory_order_acquire);
+    } while (before != sample.publish_hits);
+    sample.entry_hits = dock_motion_entry_hits.load(std::memory_order_acquire);
     return true;
 }
 
@@ -108,27 +115,31 @@ public:
         return clazz != nullptr && AIBinder_associateClass(window_, clazz);
     }
 
-    bool send(const Sample &sample) {
+    enum class SendResult { failed, acknowledged, revalidate };
+
+    SendResult send(const Sample &sample) {
         AParcel *input = nullptr;
         if (AIBinder_prepareTransaction(window_, &input) != STATUS_OK || input == nullptr) {
-            return false;
+            return SendResult::failed;
         }
         if (AParcel_writeInt64(input, static_cast<int64_t>(sample.sequence)) != STATUS_OK
             || AParcel_writeInt64(input, static_cast<int64_t>(sample.uptime_ns)) != STATUS_OK
             || AParcel_writeInt64(input, static_cast<int64_t>(sample.value)) != STATUS_OK
-            || AParcel_writeInt64(input, static_cast<int64_t>(sample.edit_state)) != STATUS_OK) {
+            || AParcel_writeInt64(input, static_cast<int64_t>(sample.entry_hits)) != STATUS_OK
+            || AParcel_writeInt64(input, static_cast<int64_t>(sample.publish_hits)) != STATUS_OK) {
             AParcel_delete(input);
-            return false;
+            return SendResult::failed;
         }
         AParcel *output = nullptr;
         const binder_status_t status = AIBinder_transact(window_, kMotionTransaction,
             &input, &output, 0);
         int32_t acknowledgment = 0;
-        const bool acknowledged = status == STATUS_OK && output != nullptr
-            && AParcel_readInt32(output, &acknowledgment) == STATUS_OK
-            && acknowledgment == kMotionAck;
+        const bool replied = status == STATUS_OK && output != nullptr
+            && AParcel_readInt32(output, &acknowledgment) == STATUS_OK;
         if (output != nullptr) AParcel_delete(output);
-        return acknowledged;
+        if (!replied) return SendResult::failed;
+        if (acknowledgment == kMotionAckRevalidate) return SendResult::revalidate;
+        return acknowledgment == kMotionAck ? SendResult::acknowledged : SendResult::failed;
     }
 
 private:
@@ -139,24 +150,47 @@ private:
 bool prepare_dock_motion() {
     dock_motion_event = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (dock_motion_event < 0) return false;
-    // Hooks are installed only after this succeeds. Keep notifications enabled while
-    // Binder reconnects so a gesture racing recovery is coalesced in the eventfd.
-    dock_motion_subscribed.store(1, std::memory_order_release);
+    // Hook installation is transactional. Do not let a partial installation
+    // publish until the native hook manager has verified all three patches.
+    dock_motion_subscribed.store(0, std::memory_order_release);
     return true;
 }
+
+void activate_dock_motion() {
+    if (dock_motion_subscribed.exchange(1, std::memory_order_acq_rel) == 0
+        && dock_motion_event >= 0) {
+        // A gesture may have updated the coalesced sample while hooks were being
+        // repaired. Wake the sender as soon as subscription is restored instead
+        // of making the next gesture wait for the poll timeout.
+        (void)eventfd_write(dock_motion_event, 1);
+    }
+}
+
+void deactivate_dock_motion() {
+    dock_motion_subscribed.store(0, std::memory_order_release);
+}
+
+uint64_t active_dock_motion_callbacks() {
+    return dock_motion_active_callbacks.load(std::memory_order_acquire);
+}
+
+bool revalidate_dock_motion_hooks();
 
 void run_dock_motion() {
     const int event = dock_motion_event;
     if (event < 0) return;
     constexpr int kPollMs = 1000;
     constexpr uint64_t kKeepAliveNs = 5000000000ULL;
+    constexpr uint64_t kRevalidationRetryNs = 750000000ULL;
     constexpr uint64_t kSuspendGapNs = 5000000000ULL;
     unsigned reconnects = 0;
     bool unavailable_reported = false;
     for (;;) {
         WindowBinderTransport transport;
         Sample sample{};
-        if (!transport.connect() || !current_sample(sample) || !transport.send(sample)) {
+        const auto initial = transport.connect() && current_sample(sample)
+            ? transport.send(sample) : WindowBinderTransport::SendResult::failed;
+        if (initial == WindowBinderTransport::SendResult::failed) {
             if (!unavailable_reported) {
                 __android_log_print(ANDROID_LOG_WARN, kTag,
                     "motion Binder transport unavailable; retrying in background");
@@ -165,21 +199,34 @@ void run_dock_motion() {
             retry_delay();
             continue;
         }
+        bool revalidation_pending = initial == WindowBinderTransport::SendResult::revalidate;
+        uint64_t last_revalidation_ns = 0;
+        if (revalidation_pending) {
+            revalidate_dock_motion_hooks();
+            last_revalidation_ns = sample.uptime_ns;
+        }
 
         unavailable_reported = false;
         __android_log_print(ANDROID_LOG_INFO, kTag,
-        "motion v25 ready: native scale/edit with suspend-aware Binder recovery reconnect=%u",
+            "motion v31 ready: semantic native scale with multi-runtime tracking reconnect=%u",
             reconnects);
 
         bool disconnected = false;
         uint64_t last_value = sample.value;
-        uint64_t last_edit_state = sample.edit_state;
+        uint64_t last_publish_hits = sample.publish_hits;
         uint64_t last_sent_ns = sample.uptime_ns;
         uint64_t last_boot_ns = 0;
         uint64_t last_mono_ns = 0;
         if (!clock_ns(CLOCK_BOOTTIME, last_boot_ns)
-            || !clock_ns(CLOCK_MONOTONIC, last_mono_ns)) break;
-        bool resumed = false;
+            || !clock_ns(CLOCK_MONOTONIC, last_mono_ns)) {
+            // Never terminate the transport on a clock failure. Returning here used to
+            // end run_dock_motion() for the whole launcher process, and nothing re-armed
+            // it, so real-time following stayed dead until the desktop was restarted.
+            // Rebuild the transport instead and keep the worker alive.
+            ++reconnects;
+            retry_delay();
+            continue;
+        }
         while (!disconnected) {
             pollfd descriptor{event, POLLIN, 0};
             int result;
@@ -197,19 +244,23 @@ void run_dock_motion() {
                 disconnected = true;
                 continue;
             }
-            // Both clocks advance while this worker is merely descheduled or frozen.
-            // Only CLOCK_BOOTTIME advances through device suspend, so compare their
-            // deltas instead of treating any long scheduling gap as a screen resume.
             const uint64_t boot_delta = boot_ns >= last_boot_ns
                 ? boot_ns - last_boot_ns : UINT64_MAX;
             const uint64_t mono_delta = mono_ns >= last_mono_ns
                 ? mono_ns - last_mono_ns : UINT64_MAX;
-            if (boot_delta == UINT64_MAX || mono_delta == UINT64_MAX
-                || (boot_delta > mono_delta && boot_delta - mono_delta > kSuspendGapNs)) {
-                resumed = true;
+            if (boot_delta == UINT64_MAX || mono_delta == UINT64_MAX) {
                 disconnected = true;
                 continue;
             }
+            // A short suspend/resume cycle is normal while the screen is off; the device
+            // was observed resuming every ~10-20 s. Tearing the transport down here used
+            // to cost 0.4-3.7 s per cycle with no sample delivered, which is exactly the
+            // window in which the first post-unlock swipe lost its real-time follow.
+            // The Binder proxy survives suspend, so rebase the clock baseline, force one
+            // immediate publish, and keep the connection. A genuinely stale proxy is
+            // still caught by the failing send below, which rebuilds it.
+            const bool suspended = boot_delta > mono_delta
+                && boot_delta - mono_delta > kSuspendGapNs;
             last_boot_ns = boot_ns;
             last_mono_ns = mono_ns;
             if (descriptor.revents & POLLIN) {
@@ -223,29 +274,42 @@ void run_dock_motion() {
                 disconnected = true;
                 continue;
             }
-            const bool changed = sample.value != last_value || sample.edit_state != last_edit_state;
+            if (suspended) {
+                __android_log_print(ANDROID_LOG_INFO, kTag,
+                    "device resume detected; reusing motion Binder transport");
+            }
+            const bool changed = suspended || sample.value != last_value
+                || sample.publish_hits != last_publish_hits;
             const bool keep_alive = !changed
                 && (sample.uptime_ns - last_sent_ns) >= kKeepAliveNs;
-            if (changed || keep_alive) {
-                if (!transport.send(sample)) {
+            const bool revalidation_probe = revalidation_pending
+                && sample.uptime_ns - last_sent_ns >= kRevalidationRetryNs;
+            if (changed || keep_alive || revalidation_probe) {
+                const auto sent = transport.send(sample);
+                if (sent == WindowBinderTransport::SendResult::failed) {
                     disconnected = true;
                     continue;
                 }
+                if (sent == WindowBinderTransport::SendResult::revalidate) {
+                    revalidation_pending = true;
+                    if (sample.uptime_ns - last_revalidation_ns >= kRevalidationRetryNs) {
+                        revalidate_dock_motion_hooks();
+                        last_revalidation_ns = sample.uptime_ns;
+                    }
+                } else {
+                    revalidation_pending = false;
+                }
                 last_value = sample.value;
-                last_edit_state = sample.edit_state;
+                last_publish_hits = sample.publish_hits;
                 last_sent_ns = sample.uptime_ns;
             }
         }
 
-        if (resumed) {
-            __android_log_print(ANDROID_LOG_INFO, kTag,
-                "device resume detected; rebuilding motion Binder transport");
-        }
         if (reconnects < 3) {
             __android_log_print(ANDROID_LOG_WARN, kTag,
                 "motion Binder transport disconnected; reconnecting");
         }
         ++reconnects;
-        if (!resumed) retry_delay();
+        retry_delay();
     }
 }

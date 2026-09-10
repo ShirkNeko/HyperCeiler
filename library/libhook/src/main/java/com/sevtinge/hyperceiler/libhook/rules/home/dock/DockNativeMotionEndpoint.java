@@ -11,49 +11,78 @@ import java.util.function.Consumer;
 
 /** Authenticated custom transaction carried by MiuiHome's existing IWindowManager Binder. */
 public final class DockNativeMotionEndpoint {
-    // Versioned to bypass the already-loaded short-circuiting v21 callback. From v22 onward
-    // every callback restores the Parcel and yields, so future hot reloads share this code.
-    public static final int TRANSACTION_CODE = 0x00484346;
+    // Versioned so a hot-reloaded v30 endpoint cannot consume or overwrite the
+    // persistent v31 revalidation acknowledgment.
+    public static final int TRANSACTION_CODE = 0x0048434A;
     public static final int ACK = 0x48434B32;
+    public static final int ACK_REVALIDATE = 0x48434B33;
     private static final String DESCRIPTOR = "android.view.IWindowManager";
 
     private record Identity(int uid, int pid) { }
-    private record State(Identity identity, DockNativeMotion.Sample sample) { }
-    private record Pending(Identity identity, DockNativeMotion.Sample sample) { }
-    private final AtomicReference<State> state = new AtomicReference<>(new State(null, null));
+    private record State(Identity identity, DockNativeMotion.Sample sample, long sequence) { }
+    private record Pending(Identity identity, DockNativeMotion.Sample sample, long sequence) { }
+    private record OverviewHit(Identity identity, long timestamp) { }
+    private record Revalidation(Identity identity, long publishHits) { }
+    private enum AcceptResult { REJECTED, IDENTITY_CHANGED, KEEPALIVE, PROGRESSED }
+    private final AtomicReference<State> state = new AtomicReference<>(new State(null, null, 0));
     private final AtomicReference<Pending> pending = new AtomicReference<>();
+    private final AtomicReference<OverviewHit> overviewHit = new AtomicReference<>();
+    private final AtomicReference<Revalidation> revalidation = new AtomicReference<>();
     private final AtomicInteger reported = new AtomicInteger();
     private final Runnable changed;
+    private final Runnable keepalive;
     private final Consumer<String> diagnostic;
 
     public DockNativeMotionEndpoint(Runnable changed, Consumer<String> diagnostic) {
+        this(changed, () -> { }, diagnostic);
+    }
+
+    public DockNativeMotionEndpoint(Runnable changed, Runnable keepalive,
+                                    Consumer<String> diagnostic) {
         this.changed = changed;
+        this.keepalive = keepalive;
         this.diagnostic = diagnostic;
     }
 
     public void bindIdentity(int uid, int pid) {
+        if (uid < 10000 || pid <= 0) return;
         Identity replacement = new Identity(uid, pid);
         Pending early = pending.getAndSet(null);
         State rebound = state.updateAndGet(current -> {
-            DockNativeMotion.Sample sample = replacement.equals(current.identity())
-                ? current.sample() : null;
+            boolean sameIdentity = replacement.equals(current.identity());
+            DockNativeMotion.Sample sample = sameIdentity ? current.sample() : null;
+            long sequence = sameIdentity ? current.sequence() : 0;
             if (early != null && replacement.equals(early.identity())
-                    && (sample == null || early.sample().sequence() > sample.sequence())) {
-                sample = early.sample();
+                    && early.sequence() > sequence) {
+                if (early.sample() != null
+                        && DockNativeMotion.hasPublishedProgress(sample, early.sample())) {
+                    sample = early.sample();
+                }
+                sequence = early.sequence();
             }
-            if (replacement.equals(current.identity()) && sample == current.sample()) return current;
-            return new State(replacement, sample);
+            if (sameIdentity && sample == current.sample() && sequence == current.sequence()) {
+                return current;
+            }
+            return new State(replacement, sample, sequence);
         });
-        boolean promoted = early != null && rebound.sample() == early.sample();
+        OverviewHit hit = overviewHit.get();
+        if (hit != null && !replacement.equals(hit.identity())) overviewHit.compareAndSet(hit, null);
+        Revalidation requested = revalidation.get();
+        if (requested != null && !replacement.equals(requested.identity())) {
+            revalidation.compareAndSet(requested, null);
+        }
+        boolean promoted = early != null && early.sample() != null
+                && rebound.sample() == early.sample();
+        if (promoted) recordOverview(replacement, early.sample());
         // Covers a packet racing between pending.getAndSet() and the state update.
         if (promotePending(replacement)) promoted = true;
         if (promoted) notifyChanged();
     }
 
     /** Must be called only from IWindowManager.Stub.onTransact while Binder identity is intact. */
-    public boolean receive(int code, Parcel data, int flags) {
-        if (code != TRANSACTION_CODE) return false;
-        data.enforceInterface("android.view.IWindowManager");
+    public int receive(int code, Parcel data, int flags) {
+        if (code != TRANSACTION_CODE) return 0;
+        data.enforceInterface(DESCRIPTOR);
         State current = state.get();
         Identity expected = current.identity();
         int callerUid = Binder.getCallingUid();
@@ -67,34 +96,132 @@ public final class DockNativeMotionEndpoint {
         // ever blocking its render callback.
         if ((flags & IBinder.FLAG_ONEWAY) != 0) {
             report(2, "native motion Binder rejected: one-way call has no trusted PID");
-            return true;
+            return ACK;
         }
         Identity caller = new Identity(callerUid, callerPid);
-        if (expected != null && callerUid != expected.uid()) {
-            report(8, "native motion Binder rejected: caller UID mismatch");
-            return true;
+        if (callerUid < 10000 || callerPid <= 0
+                || (expected != null && expected.uid() != callerUid)) {
+            report(8, "native motion Binder rejected: caller UID/identity mismatch");
+            return ACK;
         }
-        if (available != Long.BYTES * 4) {
+        if (available != Long.BYTES * 5) {
             report(16, "native motion Binder rejected: payload bytes=" + available);
-            return true;
+            return ACK;
         }
-        boolean identityMatches = expected != null && expected.uid() == callerUid;
+        boolean identityMatches = expected != null && expected.equals(caller);
+        Pending early = pending.get();
+        long previousSequence = identityMatches ? current.sequence()
+                : early != null && caller.equals(early.identity()) ? early.sequence() : 0;
         DockNativeMotion.Sample sample = DockNativeMotion.validate(
-            data.readLong(), data.readLong(), data.readLong(), data.readLong(),
-            identityMatches && current.sample() != null ? current.sample().sequence() : 0,
+            data.readLong(), data.readLong(), data.readLong(), data.readLong(), data.readLong(),
+            previousSequence,
             System.nanoTime());
         if (sample != null && !identityMatches) {
-            pending.set(new Pending(caller, sample));
+            boolean pendingProgressed = retainPending(caller, sample);
+            if (pendingProgressed && sample.scene() == 1) {
+                recordOverview(caller, sample);
+            }
             report(4, "native motion Binder retained sample until exact launcher PID binds");
             if (promotePending(caller)) notifyChanged();
-            return true;
+            return acknowledgment(caller);
         }
-        if (sample != null && state.compareAndSet(current, new State(expected, sample))) {
+        boolean overviewProgressed = sample != null && sample.scene() == 1
+                && DockNativeMotion.hasPublishedProgress(current.sample(), sample);
+        if (overviewProgressed) {
+            // Preserve a short scene-1 transition even if a concurrent scene-2 packet wins the
+            // latest-state CAS before WMS consumes either packet.
+            recordOverview(caller, sample);
+        }
+        AcceptResult accepted = sample == null
+                ? AcceptResult.REJECTED : acceptBoundSample(caller, sample);
+        if (sample != null && accepted == AcceptResult.IDENTITY_CHANGED) {
+            // Window replacement can bind a new PID between the initial state
+            // snapshot and this CAS. Isolate the packet until WindowState
+            // independently authenticates that exact PID; never apply it to the
+            // old launcher identity.
+            boolean pendingProgressed = retainPending(caller, sample);
+            if (pendingProgressed && sample.scene() == 1) recordOverview(caller, sample);
+            if (promotePending(caller)) notifyChanged();
+            report(4, "native motion Binder retained sample across launcher PID rebind");
+            return acknowledgment(caller);
+        }
+        if (sample != null) {
             report(32, "native motion Binder sample accepted");
-            notifyChanged();
+            if (accepted == AcceptResult.PROGRESSED) notifyChanged();
+            else if (accepted == AcceptResult.KEEPALIVE) notifyKeepalive();
+            if (accepted != AcceptResult.REJECTED
+                    && completeRevalidation(caller, sample)) {
+                report(256, "native motion semantic hook revalidation recovered progress");
+            }
         }
         if (sample == null) report(64, "native motion Binder rejected: invalid or stale sample");
-        return true;
+        return acknowledgment(caller);
+    }
+
+    public void requestHookRevalidation(int uid, int pid) {
+        if (uid < 10000 || pid <= 0) return;
+        Identity identity = new Identity(uid, pid);
+        State current = state.get();
+        long baseline = identity.equals(current.identity()) && current.sample() != null
+                ? current.sample().publishHits() : 0;
+        revalidation.updateAndGet(requested -> requested != null
+                && identity.equals(requested.identity()) ? requested
+                : new Revalidation(identity, baseline));
+    }
+
+    private int acknowledgment(Identity caller) {
+        Revalidation requested = revalidation.get();
+        if (requested != null && caller.equals(requested.identity())) {
+            report(128, "native motion requested semantic hook revalidation");
+            return ACK_REVALIDATE;
+        }
+        return ACK;
+    }
+
+    private boolean completeRevalidation(Identity caller, DockNativeMotion.Sample sample) {
+        for (;;) {
+            Revalidation requested = revalidation.get();
+            if (requested == null || !caller.equals(requested.identity())
+                    || sample.publishHits() <= requested.publishHits()) return false;
+            if (revalidation.compareAndSet(requested, null)) return true;
+        }
+    }
+
+    private void recordOverview(Identity identity, DockNativeMotion.Sample sample) {
+        if (identity != null && sample.scene() == 1) {
+            overviewHit.updateAndGet(current -> current != null
+                    && identity.equals(current.identity())
+                    && current.timestamp() >= sample.uptimeNanos() ? current
+                    : new OverviewHit(identity, sample.uptimeNanos()));
+        }
+    }
+
+    private boolean retainPending(Identity identity, DockNativeMotion.Sample sample) {
+        for (;;) {
+            Pending current = pending.get();
+            if (current != null && identity.equals(current.identity())
+                    && current.sequence() >= sample.sequence()) return false;
+            DockNativeMotion.Sample previous = current != null
+                    && identity.equals(current.identity()) ? current.sample() : null;
+            boolean progressed = DockNativeMotion.hasPublishedProgress(previous, sample);
+            DockNativeMotion.Sample effective = progressed ? sample : previous;
+            if (pending.compareAndSet(current,
+                    new Pending(identity, effective, sample.sequence()))) return progressed;
+        }
+    }
+
+    private AcceptResult acceptBoundSample(Identity identity, DockNativeMotion.Sample sample) {
+        for (;;) {
+            State current = state.get();
+            if (!identity.equals(current.identity())) return AcceptResult.IDENTITY_CHANGED;
+            if (sample.sequence() <= current.sequence()) return AcceptResult.REJECTED;
+            boolean progressed = DockNativeMotion.hasPublishedProgress(current.sample(), sample);
+            DockNativeMotion.Sample effective = progressed ? sample : current.sample();
+            if (state.compareAndSet(current,
+                    new State(identity, effective, sample.sequence()))) {
+                return progressed ? AcceptResult.PROGRESSED : AcceptResult.KEEPALIVE;
+            }
+        }
     }
 
     /** Promote only after WindowState has independently authenticated this exact UID/PID. */
@@ -104,14 +231,18 @@ public final class DockNativeMotionEndpoint {
             State current = state.get();
             if (early == null || !identity.equals(early.identity())
                     || !identity.equals(current.identity())) return false;
-            DockNativeMotion.Sample old = current.sample();
-            if (old != null && early.sample().sequence() <= old.sequence()) {
+            if (early.sequence() <= current.sequence()) {
                 pending.compareAndSet(early, null);
                 return false;
             }
-            if (state.compareAndSet(current, new State(identity, early.sample()))) {
+            boolean progressed = early.sample() != null && DockNativeMotion.hasPublishedProgress(
+                    current.sample(), early.sample());
+            DockNativeMotion.Sample effective = progressed ? early.sample() : current.sample();
+            if (state.compareAndSet(current,
+                    new State(identity, effective, early.sequence()))) {
                 pending.compareAndSet(early, null);
-                return true;
+                if (progressed) recordOverview(identity, early.sample());
+                return progressed;
             }
         }
     }
@@ -133,7 +264,15 @@ public final class DockNativeMotionEndpoint {
         try {
             changed.run();
         } catch (RuntimeException ignored) {
-            // Motion/edit visibility is optional; never unwind into WMS.
+            // Motion notification is optional; never unwind into WMS.
+        }
+    }
+
+    private void notifyKeepalive() {
+        try {
+            keepalive.run();
+        } catch (RuntimeException ignored) {
+            // Health notification is optional; never unwind into WMS.
         }
     }
 
@@ -142,8 +281,14 @@ public final class DockNativeMotionEndpoint {
         Identity expected = current.identity();
         DockNativeMotion.Sample sample = current.sample();
         long now = System.nanoTime();
-        return expected != null && expected.uid() == uid
+        return expected != null && expected.equals(new Identity(uid, pid))
                 && sample != null && sample.uptimeNanos() <= now
                 && now - sample.uptimeNanos() <= DockNativeMotion.MAX_AGE_NS ? sample : null;
+    }
+
+    public boolean sawOverviewSince(int uid, int pid, long timestamp) {
+        OverviewHit hit = overviewHit.get();
+        return hit != null && hit.identity().equals(new Identity(uid, pid))
+            && hit.timestamp() >= timestamp;
     }
 }

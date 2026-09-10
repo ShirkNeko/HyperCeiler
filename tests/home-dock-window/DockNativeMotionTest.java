@@ -5,14 +5,13 @@ import com.sevtinge.hyperceiler.libhook.rules.home.dock.DockNativeMotion;
 import com.sevtinge.hyperceiler.libhook.rules.home.dock.DockRecentsMotion;
 
 public class DockNativeMotionTest {
-    private static DockNativeMotion.Sample sample(long sequence, long time, int scene, double scale, int editState,
-                                                   long previousSequence, long now) {
-        long packed = (Double.doubleToRawLongBits(scale) & ~3L) | scene;
-        return DockNativeMotion.validate(sequence, time, packed, editState, previousSequence, now);
-    }
     private static DockNativeMotion.Sample sample(long sequence, long time, int scene, double scale,
                                                    long previousSequence, long now) {
-        return sample(sequence, time, scene, scale, 0, previousSequence, now);
+        return DockNativeMotion.validate(sequence, time, packed(scene, scale),
+            1, 1, previousSequence, now);
+    }
+    private static long packed(int scene, double scale) {
+        return (Double.doubleToRawLongBits(scale) & ~3L) | scene;
     }
     private static void check(boolean value) { if (!value) throw new AssertionError(); }
     private static void near(float actual, float expected) { check(Math.abs(actual - expected) < 0.001); }
@@ -26,13 +25,25 @@ public class DockNativeMotionTest {
             check(sample(1, now, 1, invalid, 0, now) == null);
         }
         check(sample(1, now, 3, .99, 0, now) == null);
-        check(sample(1, now, 1, .99, 9, 0, now) == null);
-        check(sample(1, now, 1, .99, -1, 0, now) == null);
-        Boolean[] hidden = {null, false, false, true, true, true, true, false, true};
-        for (int state = 0; state < hidden.length; state++) {
-            DockNativeMotion.Sample edit = sample(state + 1L, now, 0, 1, state, 0, now);
-            check(edit != null && edit.editHidden() == hidden[state]);
-        }
+        check(DockNativeMotion.validate(1, now,
+            packed(1, .99), -1, 0, 0, now) == null);
+        check(DockNativeMotion.validate(1, now,
+            packed(1, .99), 0, -1, 0, now) == null);
+        check(DockNativeMotion.validate(1, now,
+            packed(1, .99), 1, 2, 0, now) == null);
+        DockNativeMotion.Sample initialKeepalive = DockNativeMotion.validate(1, now,
+            packed(0, 1), 3, 0, 0, now);
+        check(initialKeepalive != null
+            && !DockNativeMotion.hasPublishedProgress(null, initialKeepalive));
+        DockNativeMotion.Sample published = DockNativeMotion.validate(2, now,
+            packed(1, .99), 4, 1, 1, now);
+        check(DockNativeMotion.hasPublishedProgress(null, published));
+        DockNativeMotion.Sample entryOnly = DockNativeMotion.validate(3, now,
+            packed(1, .99), 5, 1, 2, now);
+        check(!DockNativeMotion.hasPublishedProgress(published, entryOnly));
+        DockNativeMotion.Sample nextPublish = DockNativeMotion.validate(4, now,
+            packed(1, .99), 6, 2, 3, now);
+        check(DockNativeMotion.hasPublishedProgress(published, nextPublish));
         DockNativeMotion hinted = new DockNativeMotion();
         hinted.accept(sample(1, now, 0, .98, 0, now), true);
         near(hinted.progress(), .4f); // Verified overview target fills a transient native scene gap.
@@ -43,6 +54,13 @@ public class DockNativeMotionTest {
         hinted.accept(sample(4, now, 1, .97, 0, now), false);
         hinted.accept(sample(5, now, 0, .85, 0, now), false);
         near(hinted.progress(), 0); // Folder/app scale cannot inherit an old recents latch.
+        DockNativeMotion lateHint = new DockNativeMotion();
+        DockNativeMotion.Sample beforeOverview = sample(1, now, 0, .98, 0, now);
+        lateHint.accept(beforeOverview, false);
+        near(lateHint.progress(), 0);
+        check(lateHint.accept(beforeOverview, true));
+        near(lateHint.progress(), .4f); // The later window hint reinterprets the same sample.
+        check(!lateHint.accept(beforeOverview, true));
         DockNativeMotion motion = new DockNativeMotion();
         motion.accept(sample(1, now, 2, .96, 0, now));
         near(motion.progress(), 0); // Folder/home return cannot start a recents lift.

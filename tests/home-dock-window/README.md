@@ -1,9 +1,9 @@
 # HyperOS 4 Dock window regression checks
 
-Current native implementation: [v25 dynamic motion resolution, optional edit observation,
-verification, acknowledged Binder reconnect, and suspend recovery](NATIVE_DYNAMIC_RESOLUTION.md).
-Java hook diagnostic version 24 additionally fixes remote glass surface lifetime and
-immediate recovery after a live renderer is force-stopped:
+Current native implementation: [v31 semantic dynamic motion resolution,
+concurrent runtime banks, persistent acknowledged recovery, and suspend/frame-channel
+recovery](NATIVE_DYNAMIC_RESOLUTION.md). Java hook diagnostic version 31 also fixes
+remote glass surface lifetime and immediate recovery after a live renderer is force-stopped:
 attach and detach are serialized on the IPC worker, never deferred in WMS's sync
 transaction. Each generation is explicitly reparented to null before releasing
 its SurfacePackage. Late attachment requests are rejected after retirement; a
@@ -24,10 +24,14 @@ policy remain untouched. It first verifies exclusive package ownership and check
 PID-to-UID identity to prevent PID reuse. The lease is removed on disposal,
 mode change and hot reload; other UIDs are never altered and no persistent
 whitelist, global setting, started service or foreground service is created.
-Long process freezes and deep sleep are detected with `CLOCK_BOOTTIME`; the native
-worker rebuilds its dynamically acquired WindowManager Binder before forwarding the
-next coalesced launcher sample. A five-second idle health packet replaces frequent
-polling, while hook notifications remain enabled during reconnection.
+Long process freezes and deep sleep are detected by comparing `CLOCK_BOOTTIME` with
+`CLOCK_MONOTONIC`; the native worker rebuilds its dynamically acquired WindowManager
+Binder before forwarding the next coalesced launcher sample. A five-second idle health
+packet exercises the frame channel without extending the lifetime of stale motion.
+Native hook bytes and the complete executable `libapp.so` mapping inventory are checked
+independently. Each file identity/load bias receives its own immutable hook bank, so a
+runtime generation change is covered without moving shared layout/trampoline state away
+from a still-active older generation.
 The probe/v7 sections below are historical investigation notes; their address
 profiles and opt-in probe have been removed and are not used by current builds.
 
@@ -60,6 +64,10 @@ javac -d "$dock_test_dir" \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassProcessPolicy.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockWallpaperEndpoint.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockNativeMotion.java \
+  library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockNativeMotionEndpoint.java \
+  tests/home-dock-window/stubs/android/os/IBinder.java \
+  tests/home-dock-window/stubs/android/os/Binder.java \
+  tests/home-dock-window/stubs/android/os/Parcel.java \
   tests/home-dock-window/DockWindowPolicyTest.java \
   tests/home-dock-window/DockGlassPresetTest.java \
   tests/home-dock-window/DockRecentsMotionTest.java \
@@ -67,8 +75,9 @@ javac -d "$dock_test_dir" \
   tests/home-dock-window/DockGlassSurfaceLeaseTest.java \
   tests/home-dock-window/DockGlassProcessPolicyTest.java \
   tests/home-dock-window/DockWallpaperEndpointTest.java \
-  tests/home-dock-window/DockNativeMotionTest.java
-for test in DockWindowPolicy DockGlassPreset DockRecentsMotion DockGlassRetryPolicy DockGlassSurfaceLease DockGlassProcessPolicy DockWallpaperEndpoint DockNativeMotion; do
+  tests/home-dock-window/DockNativeMotionTest.java \
+  tests/home-dock-window/DockNativeMotionEndpointTest.java
+for test in DockWindowPolicy DockGlassPreset DockRecentsMotion DockGlassRetryPolicy DockGlassSurfaceLease DockGlassProcessPolicy DockWallpaperEndpoint DockNativeMotion DockNativeMotionEndpoint; do
   java -cp "$dock_test_dir" "com.sevtinge.hyperceiler.tests.dock.${test}Test"
 done
 ```

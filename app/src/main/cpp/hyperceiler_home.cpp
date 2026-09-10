@@ -16,7 +16,8 @@
 #include <string_view>
 
 #ifdef HYPERCEILER_DOCK_NATIVE_MOTION
-void start_dock_native_motion(int (*hook)(void *, void *, void **));
+void start_dock_native_motion(int (*hook)(void *, void *, void **), int (*unhook)(void *));
+uint32_t dock_native_motion_state();
 #endif
 
 namespace {
@@ -28,18 +29,21 @@ using UnhookFunction = int (*)(void *function);
 using NativeOnModuleLoaded = void (*)(const char *name, void *handle);
 
 struct NativeApiEntries {
-    // Loader-owned ABI: unused optional entries still occupy their original slots.
+    // Loader-owned LSPosed ABI. unhook_func is optional at runtime: immutable
+    // per-generation banks never need to tear down a live replacement.
     uint32_t version;
     HookFunction hook_func;
-    [[maybe_unused]] UnhookFunction unhook_func;
+    UnhookFunction unhook_func;
 };
 
 HookFunction g_hook_function = nullptr;
+UnhookFunction g_unhook_function = nullptr;
 std::atomic_bool g_property_hook_installed = false;
 std::atomic_bool g_process_name_hook_installed = false;
 std::atomic_bool g_high_device_level = false;
 std::atomic_bool g_disable_prestart = false;
 std::atomic_bool g_soft_glass = false;
+std::atomic_bool g_configured = false;
 // 0=not specialized yet, 1=launcher, 2=another app. The spawner's zero state is
 // inherited independently by every child.
 std::atomic_int g_process_kind = 0;
@@ -60,7 +64,17 @@ bool is_launcher_process() {
 
 void start_motion_after_specialization() {
 #ifdef HYPERCEILER_DOCK_NATIVE_MOTION
-    if (g_process_kind.load(std::memory_order_acquire) != 0) return;
+    const int kind = g_process_kind.load(std::memory_order_acquire);
+    // A launcher child re-asserts the start on every later signal. setprogname can run
+    // before the hook API is published, and a start that failed at that moment is
+    // otherwise unrecoverable in-process: the chain then never publishes a sample and
+    // following looks dead until the desktop is restarted. start_dock_native_motion()
+    // is idempotent, so re-asserting costs a single atomic exchange.
+    if (kind == 1) {
+        start_dock_native_motion(g_hook_function, g_unhook_function);
+        return;
+    }
+    if (kind != 0) return;
     char name[128]{};
     FILE *file = std::fopen("/proc/self/cmdline", "r");
     if (file == nullptr) return;
@@ -70,7 +84,7 @@ void start_motion_after_specialization() {
     const std::string_view process(name);
     if (process == "com.miui.home") {
         g_process_kind.store(1, std::memory_order_release);
-        start_dock_native_motion(g_hook_function);
+        start_dock_native_motion(g_hook_function, g_unhook_function);
     } else if (process != "usap64" && process != "hyos_spawner") {
         // Avoid a /proc read on every property query in unrelated descendants.
         g_process_kind.store(2, std::memory_order_release);
@@ -148,7 +162,7 @@ void hooked_setprogname(const char *name) {
         && g_process_kind.exchange(1, std::memory_order_acq_rel) != 1) {
         __android_log_print(ANDROID_LOG_INFO, kLogTag,
             "launcher child detected after setprogname; starting native motion");
-        start_dock_native_motion(g_hook_function);
+        start_dock_native_motion(g_hook_function, g_unhook_function);
     }
 #endif
 }
@@ -203,20 +217,49 @@ void on_library_loaded(const char *name, void *) {
     // itself waits for and dynamically resolves libapp.so.
     if (launcher) {
         install_property_hook();
-        start_dock_native_motion(g_hook_function);
+        start_dock_native_motion(g_hook_function, g_unhook_function);
     }
 #endif
 }
 
+jint native_status() {
+    jint status = 0;
+    if (g_configured.load(std::memory_order_acquire)) status |= 1 << 0;
+    if (g_hook_function != nullptr) status |= 1 << 1;
+    if (g_unhook_function != nullptr) status |= 1 << 2;
+#ifdef HYPERCEILER_DOCK_NATIVE_MOTION
+    const uint32_t motion = dock_native_motion_state();
+    if ((motion & 1U) != 0) status |= 1 << 3;
+    if ((motion & 2U) != 0) status |= 1 << 4;
+    if ((motion & 4U) != 0) status |= 1 << 5;
+#endif
+    if (is_launcher_process()) status |= 1 << 6;
+    if (is_hyos_spawner_process()) status |= 1 << 7;
+    return status;
+}
+
 }  // namespace
 
-extern "C" JNIEXPORT void JNICALL
+extern "C" JNIEXPORT jint JNICALL
 Java_com_sevtinge_hyperceiler_libhook_rules_home_os4_NativeHomeHooks_nativeConfigure(
     JNIEnv *, jobject, jboolean high_device_level, jboolean disable_prestart,
     jboolean soft_glass) {
     g_high_device_level.store(high_device_level == JNI_TRUE, std::memory_order_relaxed);
     g_disable_prestart.store(disable_prestart == JNI_TRUE, std::memory_order_relaxed);
     g_soft_glass.store(soft_glass == JNI_TRUE, std::memory_order_relaxed);
+    g_configured.store(true, std::memory_order_release);
+#ifdef HYPERCEILER_DOCK_NATIVE_MOTION
+    if (is_launcher_process() && g_hook_function != nullptr) {
+        start_dock_native_motion(g_hook_function, g_unhook_function);
+    }
+#endif
+    return native_status();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_sevtinge_hyperceiler_libhook_rules_home_os4_NativeHomeHooks_nativeStatus(
+    JNIEnv *, jobject) {
+    return native_status();
 }
 
 extern "C" [[gnu::visibility("default")]] [[gnu::used]]
@@ -224,9 +267,10 @@ NativeOnModuleLoaded native_init(const NativeApiEntries *entries) {
     if (entries == nullptr || entries->hook_func == nullptr) return nullptr;
     const bool spawner = is_hyos_spawner_process();
     __android_log_print(ANDROID_LOG_INFO, kLogTag,
-        "native v25 hook API version=%u hyosSpawner=%d launcher=%d",
-        entries->version, spawner, is_launcher_process());
+        "native v34 hook API version=%u unhook=%d hyosSpawner=%d launcher=%d",
+        entries->version, entries->unhook_func != nullptr, spawner, is_launcher_process());
     g_hook_function = entries->hook_func;
+    g_unhook_function = entries->unhook_func;
     // Install before libapp_launcher/libapp run their static initialization and cache the
     // properties. The load callback remains as a retry path for unusual linker ordering.
     if (spawner || is_launcher_process()) install_property_hook();
@@ -234,7 +278,7 @@ NativeOnModuleLoaded native_init(const NativeApiEntries *entries) {
 #ifdef HYPERCEILER_DOCK_NATIVE_MOTION
     // In the normal path the spawner does not contain libapp.so. Starting here
     // would spend the entire retry budget before a launcher child is forked.
-    if (is_launcher_process()) start_dock_native_motion(g_hook_function);
+    if (is_launcher_process()) start_dock_native_motion(g_hook_function, g_unhook_function);
 #endif
     // Retaining the callback is harmless in unrelated scoped processes and is
     // required when HYOS specializes a process after native_init returned.

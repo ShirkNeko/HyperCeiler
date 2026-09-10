@@ -11,17 +11,17 @@ dock_test_trampoline:
 dock_test_invoke:
     stp x29, x30, [sp, #-16]!
     stp x19, x20, [sp, #-16]!
-    str x22, [sp, #-16]!
+    stp x22, x28, [sp, #-16]!
     sub sp, sp, #512
     mov x19, x2
     mov x20, x0
     mov x2, x1
     add x15, sp, #256
-    // EditMode closures receive their state argument at the top of Dart's stack.
-    str x1, [x15]
     str x15, [x19, #136]
-    mov x22, #1
-    movk x22, #0x1000, lsl #16
+    adrp x16, dock_test_null_object
+    ldr x22, [x16, :lo12:dock_test_null_object]
+    adrp x16, dock_test_heap_base
+    ldr x28, [x16, :lo12:dock_test_heap_base]
     mov x0, #100
     mov x1, #101
     mov x3, #103
@@ -50,7 +50,7 @@ dock_test_invoke:
     mrs x16, nzcv
     str x16, [x19, #128]
     add sp, sp, #512
-    ldr x22, [sp], #16
+    ldp x22, x28, [sp], #16
     ldp x19, x20, [sp], #16
     ldp x29, x30, [sp], #16
     ret

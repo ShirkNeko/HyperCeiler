@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 #include "../../app/src/main/cpp/dock_native_resolver.h"
 #include <cassert>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -12,8 +13,69 @@ template<class T> T read(const std::vector<char> &bytes, size_t offset) {
     return result;
 }
 
+constexpr uint32_t movz_x(uint32_t reg, uint16_t immediate, uint32_t halfword) {
+    return 0xd2800000u | ((halfword & 3) << 21)
+        | (static_cast<uint32_t>(immediate) << 5) | reg;
+}
+constexpr uint32_t movk_x(uint32_t reg, uint16_t immediate, uint32_t halfword) {
+    return 0xf2800000u | ((halfword & 3) << 21)
+        | (static_cast<uint32_t>(immediate) << 5) | reg;
+}
+constexpr uint32_t compressed_pointer_add(uint32_t reg, uint32_t shift_kind = 0) {
+    return 0x8b000000u | ((shift_kind & 3) << 22) | (28u << 16)
+        | (32u << 10) | (reg << 5) | reg;
+}
+
+void test_decoder_rejects_unsafe_abi() {
+    using namespace dock_motion;
+
+    const std::array materialization{movz_x(2, 0xabcd, 0), movk_x(2, 0x1234, 1)};
+    assert(materialized_u32(materialization, 2) == 0x1234abcd);
+    auto shifted_low_half = materialization;
+    shifted_low_half[0] = movz_x(2, 0xabcd, 1);
+    assert(!materialized_u32(shifted_low_half, 2));
+    auto shifted_high_half = materialization;
+    shifted_high_half[1] = movk_x(2, 0x1234, 2);
+    assert(!materialized_u32(shifted_high_half, 2));
+
+    assert(is_compressed_pointer_add(compressed_pointer_add(4)));
+    assert(!is_compressed_pointer_add(compressed_pointer_add(4, 1)));
+    assert(!is_compressed_pointer_add(compressed_pointer_add(4, 2)));
+
+    const TagAbi valid{-1, 12, 20, 8, 4, 4};
+    assert(valid_tag_abi(valid));
+    const uint32_t tag = (0xabcdeu << 12) | (3u << 8);
+    assert(class_id(tag, valid) == 0xabcde);
+    assert(object_size(tag, valid) == 48);
+    assert(!valid_tag_abi({0, 12, 20, 8, 4, 4}));
+    assert(!valid_tag_abi({-1, 13, 20, 8, 4, 4})); // class UBFX crosses bit 31.
+    assert(!valid_tag_abi({-1, 12, 20, 31, 2, 4})); // size UBFX crosses bit 31.
+    assert(!valid_tag_abi({-1, 12, 20, 10, 4, 4})); // class and size overlap.
+    assert(class_id(tag, {-1, 32, 1, 8, 4, 4}) == 0);
+    assert(object_size(tag, {-1, 12, 20, 32, 1, 4}) == 0);
+
+    const auto alpha = scalar_field(7, -1, 64, 8, 8);
+    const auto scale = scalar_field(15, -1, 64, 16, 8);
+    const auto surface = scalar_field(31, -1, 64, 4, 4);
+    const auto recents = scalar_field(35, -1, 64, 4, 4);
+    assert(alpha && alpha->begin == 8 && alpha->end == 16);
+    assert(scale && scale->begin == 16 && scale->end == 32);
+    assert(surface && recents);
+    assert(scalar_fields_disjoint(std::array{*alpha, *scale, *surface, *recents}));
+    assert(!scalar_field(8, -1, 16, 8, 1)); // Tagged bias makes this byte 9: it overruns.
+    assert(!scalar_field(6, -1, 64, 8, 8)); // Allocation-relative byte 7 is unaligned.
+    assert(!scalar_field(-1, -1, 64, 8, 8)); // Header itself is not a scalar field.
+    assert(!scalar_field(-1, -9, 64, 8, 8)); // Physical byte 8, but Layout cannot encode -1.
+    assert(!scalar_field(7, 0, 64, 8, 8));
+    assert(!scalar_field(7, -1, 64, 8, 3));
+    const auto overlapping = scalar_field(11, -1, 64, 4, 4);
+    assert(overlapping && scalar_fields_overlap(*alpha, *overlapping));
+    assert(!scalar_fields_disjoint(std::array{*alpha, *overlapping}));
+}
+
 int main(int argc, char **argv) {
     using namespace dock_motion;
+    test_decoder_rejects_unsafe_abi();
     assert(!resolve({}));
     assert(!call_target({0, {}}, 0));
     for (int arg = 1; arg < argc; ++arg) {
@@ -42,57 +104,47 @@ int main(int argc, char **argv) {
         assert(original);
         std::cout << argv[arg] << " scale=" << std::hex << original->scale
             << " animate=" << original->animate << " set=" << original->set
-            << " edit=" << original->edit << std::dec
-            << " CID=" << original->layout.params_class_id << '\n';
+            << std::dec << " CID=" << original->layout.params_class_id << '\n';
+        assert(original->layout.tagged_header_offset < 0);
+        assert(original->layout.class_id_mask != 0);
         for (auto &range : ranges) range.address += 0x7123450000ULL;
         const auto relocated = resolve(ranges);
         assert(relocated && relocated->scale == original->scale + 0x7123450000ULL);
         assert(relocated->animate == original->animate + 0x7123450000ULL);
         assert(relocated->set == original->set + 0x7123450000ULL);
-        assert(relocated->edit == (original->edit ? original->edit + 0x7123450000ULL : 0));
         // Duplicate identities must fail closed, never select the first match.
         auto duplicate = ranges;
         duplicate.push_back(ranges.front());
         assert(!resolve(duplicate));
-        const auto scale = at(ranges, relocated->scale, kScaleShape.words);
+        // Simulate HYOS retaining a patched old AOT mapping while switching to a
+        // fresh runtime mapping of the same code. Patched entries no longer have
+        // Dart prologues, so semantic resolution must select only the new copy.
+        auto old_storage = storage;
+        auto new_storage = storage;
+        std::vector<CodeRange> old_ranges;
+        std::vector<CodeRange> new_ranges;
+        constexpr uintptr_t runtime_relocation = 0x2300000000ULL;
+        for (size_t i = 0; i < ranges.size(); ++i) {
+            old_ranges.push_back({ranges[i].address, old_storage[i]});
+            new_ranges.push_back({ranges[i].address + runtime_relocation, new_storage[i]});
+        }
+        for (const auto target : {relocated->scale, relocated->animate, relocated->set}) {
+            auto entry = at(old_ranges, target, 1);
+            assert(!entry.empty());
+            *const_cast<uint32_t *>(entry.data()) = 0;
+        }
+        auto switched_ranges = old_ranges;
+        switched_ranges.insert(switched_ranges.end(), new_ranges.begin(), new_ranges.end());
+        const auto switched = resolve(switched_ranges);
+        assert(switched && switched->scale == relocated->scale + runtime_relocation);
+        assert(switched->animate == relocated->animate + runtime_relocation);
+        assert(switched->set == relocated->set + runtime_relocation);
+        const auto scale = at(ranges, relocated->scale, 1);
         auto *instruction = const_cast<uint32_t *>(scale.data());
         const auto saved = *instruction;
         *instruction = 0;
         assert(!resolve(ranges));
         *instruction = saved;
-        if (relocated->edit) {
-            const auto edit = at(ranges, relocated->edit, kEditShape.words);
-            auto *edit_instruction = const_cast<uint32_t *>(edit.data());
-            const auto saved_edit = *edit_instruction;
-            *edit_instruction = 0;
-            const auto without_edit = resolve(ranges);
-            assert(without_edit && without_edit->edit == 0);
-            *edit_instruction = saved_edit;
-        }
-        const auto factory = find(ranges, kFactoryShape).front();
-        const auto params = find(ranges, kParamsShape).front();
-        const auto setter = find(ranges, kSetShape).front();
-        auto shift_field = [](const Match &match, size_t index) {
-            auto *word = const_cast<uint32_t *>(&match.words[index]);
-            *word = (*word & ~0x001ff000u) | (static_cast<uint32_t>(field_offset(*word) + 8) << 12);
-        };
-        for (auto index : {11u, 35u, 131u, 137u}) shift_field(params, index);
-        for (auto index : {1u, 4u, 12u, 14u}) shift_field(factory, index);
-        for (auto index : {51u, 69u}) shift_field(setter, index);
-        const auto allocation = at(ranges, *call_target(factory, 0), 3);
-        auto *tag = const_cast<uint32_t *>(allocation.data());
-        const uint32_t new_tag = (*allocation_tag(allocation, 2) & 0xfffu) | (2011u << kClassIdShift);
-        tag[0] = (tag[0] & ~0x001fffe0u) | ((new_tag & 0xffff) << 5);
-        tag[1] = (tag[1] & ~0x001fffe0u) | ((new_tag >> 16) << 5);
-        const auto moved = resolve(ranges);
-        assert(moved && moved->layout.params_class_id == 2011);
-        assert(moved->layout.alpha_offset == original->layout.alpha_offset + 8);
-        assert(moved->layout.scale_offset == original->layout.scale_offset + 8);
-        assert(moved->layout.surface_offset == original->layout.surface_offset + 8);
-        assert(moved->layout.recents_offset == original->layout.recents_offset + 8);
-        // One inconsistent accessor must reject the entire resolution.
-        shift_field(setter, 51);
-        assert(!resolve(ranges));
     }
     std::cout << "Dynamic resolver tests passed\n";
 }

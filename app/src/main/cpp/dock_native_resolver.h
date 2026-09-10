@@ -1,19 +1,14 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 #pragma once
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <optional>
 #include <span>
 #include <vector>
 
 namespace dock_motion {
-// Dart's ARM64 compressed-pointer ABI is a compiler contract, not a launcher
-// address/layout profile. Launcher class IDs and field offsets are decoded below.
-inline constexpr uint32_t kClassIdShift = 12;
-inline constexpr uint32_t kClassIdMask = 0xfffff;
-
 struct CodeRange {
     uintptr_t address;
     std::span<const uint32_t> words;
@@ -27,169 +22,569 @@ struct CodeRange {
 struct Layout {
     uint32_t params_class_id;
     uint32_t double_class_id;
+    int32_t tagged_header_offset;
+    uint32_t class_id_shift;
+    uint32_t class_id_mask;
     uint32_t alpha_offset;
     uint32_t scale_offset;
     uint32_t surface_offset;
     uint32_t recents_offset;
     uint32_t double_value_offset;
+    uint32_t false_from_null;
 };
 struct Resolution {
     uintptr_t scale;
     uintptr_t animate;
     uintptr_t set;
-    uintptr_t edit;
     Layout layout;
 };
 
-// Strip relocatable operands, not opcodes/register flow. These signatures
-// describe reviewed compiler shapes; they contain no virtual/file/pool address,
-// Build ID, class ID or launcher field offset. Unknown shapes fail closed.
-inline uint32_t normalize(uint32_t word) {
-    if ((word & 0x7c000000) == 0x14000000) return word & 0xfc000000;
+inline bool same_layout(const Layout &left, const Layout &right) {
+    return left.params_class_id == right.params_class_id
+        && left.double_class_id == right.double_class_id
+        && left.tagged_header_offset == right.tagged_header_offset
+        && left.class_id_shift == right.class_id_shift
+        && left.class_id_mask == right.class_id_mask
+        && left.alpha_offset == right.alpha_offset
+        && left.scale_offset == right.scale_offset
+        && left.surface_offset == right.surface_offset
+        && left.recents_offset == right.recents_offset
+        && left.double_value_offset == right.double_value_offset
+        && left.false_from_null == right.false_from_null;
+}
+inline bool same_resolution(const Resolution &left, const Resolution &right) {
+    return left.scale == right.scale && left.animate == right.animate
+        && left.set == right.set && same_layout(left.layout, right.layout);
+}
+struct Match {
+    uintptr_t address;
+    std::span<const uint32_t> words;
+};
+
+inline constexpr size_t kMaxFunctionWords = 768;
+inline uint32_t rd(uint32_t word) { return word & 0x1f; }
+inline uint32_t rn(uint32_t word) { return (word >> 5) & 0x1f; }
+inline uint32_t rm(uint32_t word) { return (word >> 16) & 0x1f; }
+inline bool is_bl(uint32_t word) { return (word & 0xfc000000) == 0x94000000; }
+inline bool is_b(uint32_t word) { return (word & 0xfc000000) == 0x14000000; }
+inline bool is_ret(uint32_t word) { return word == 0xd65f03c0; }
+inline bool is_dart_prologue(std::span<const uint32_t> words) {
+    return words.size() >= 2 && words[0] == 0xa9bf79fd && words[1] == 0xaa0f03fd;
+}
+inline bool is_ldur_w(uint32_t word) { return (word & 0xffe00c00) == 0xb8400000; }
+inline bool is_ldur_x(uint32_t word) { return (word & 0xffe00c00) == 0xf8400000; }
+inline bool is_ldur_d(uint32_t word) { return (word & 0xffe00c00) == 0xfc400000; }
+inline bool is_stur_w(uint32_t word) { return (word & 0xffe00c00) == 0xb8000000; }
+inline bool is_stur_x(uint32_t word) { return (word & 0xffe00c00) == 0xf8000000; }
+inline bool is_stur_d(uint32_t word) { return (word & 0xffe00c00) == 0xfc000000; }
+inline int memory_offset(uint32_t word) {
+    int value = static_cast<int>((word >> 12) & 0x1ff);
+    return value >= 0x100 ? value - 0x200 : value;
+}
+inline bool is_add_imm_x(uint32_t word) { return (word & 0xff000000) == 0x91000000; }
+inline uint32_t add_imm(uint32_t word) {
+    const uint32_t value = (word >> 10) & 0xfff;
+    return ((word >> 22) & 1) != 0 ? value << 12 : value;
+}
+inline bool is_compressed_pointer_add(uint32_t word) {
+    return (word & 0xff200000) == 0x8b000000 && rn(word) == rd(word)
+        && ((word >> 22) & 3) == 0 // ADD (shifted register), LSL only.
+        && rm(word) == 28 && ((word >> 10) & 0x3f) == 32;
+}
+
+inline std::optional<uintptr_t> branch_target(uintptr_t pc, uint32_t word, bool link) {
+    if ((word & 0xfc000000) != (link ? 0x94000000u : 0x14000000u)) return {};
+    int64_t displacement = word & 0x03ffffff;
+    if ((displacement & 0x02000000) != 0) displacement -= 0x04000000;
+    displacement *= 4;
+    if (displacement < 0 && pc < static_cast<uintptr_t>(-displacement)) return {};
+    if (displacement > 0 && pc > UINTPTR_MAX - static_cast<uintptr_t>(displacement)) return {};
+    return displacement < 0 ? pc - static_cast<uintptr_t>(-displacement)
+                            : pc + static_cast<uintptr_t>(displacement);
+}
+inline std::optional<uintptr_t> call_target(const Match &match, size_t index) {
+    if (index >= match.words.size()) return {};
+    return branch_target(match.address + index * sizeof(uint32_t), match.words[index], true);
+}
+inline std::span<const uint32_t> at(std::span<const CodeRange> ranges,
+    uintptr_t address, size_t count) {
+    for (const auto &range : ranges) {
+        if (range.contains(address, count)) {
+            return range.words.subspan((address - range.address) / sizeof(uint32_t), count);
+        }
+    }
+    return {};
+}
+inline std::optional<uint32_t> materialized_u32(std::span<const uint32_t> words,
+    uint32_t reg) {
+    if (words.size() < 2 || (words[0] & 0xff80001f) != (0xd2800000 | reg)
+        || (words[1] & 0xff80001f) != (0xf2800000 | reg)
+        || ((words[0] >> 21) & 3) != 0
+        || ((words[1] >> 21) & 3) != 1) return {};
+    return ((words[0] >> 5) & 0xffff) | (((words[1] >> 5) & 0xffff) << 16);
+}
+inline std::optional<std::pair<uint32_t, uint32_t>> ubfx(uint32_t word,
+    uint32_t source, uint32_t destination) {
+    if ((word & 0xffc00000) != 0xd3400000 || rn(word) != source || rd(word) != destination) {
+        return {};
+    }
+    const uint32_t shift = (word >> 16) & 0x3f;
+    const uint32_t last = (word >> 10) & 0x3f;
+    if (last < shift) return {};
+    return std::pair{shift, last - shift + 1};
+}
+inline std::optional<uint32_t> lsl_amount(uint32_t word, uint32_t reg) {
+    if ((word & 0xffc00000) != 0xd3400000 || rn(word) != reg || rd(word) != reg) return {};
+    const uint32_t rotate = (word >> 16) & 0x3f;
+    const uint32_t last = (word >> 10) & 0x3f;
+    if (rotate == 0 || last + 1 != rotate) return {};
+    return 64 - rotate;
+}
+
+inline std::vector<Match> functions(std::span<const CodeRange> ranges) {
+    std::vector<Match> result;
+    for (const auto &range : ranges) {
+        for (size_t start = 0; start + 2 <= range.words.size(); ++start) {
+            if (!is_dart_prologue(range.words.subspan(start))) continue;
+            const size_t available = std::min(kMaxFunctionWords, range.words.size() - start);
+            size_t length = 0;
+            for (size_t i = 2; i < available; ++i) {
+                if (is_ret(range.words[start + i])) {
+                    length = i + 1;
+                    break;
+                }
+            }
+            if (length != 0) {
+                result.push_back({range.address + start * sizeof(uint32_t),
+                    range.words.subspan(start, length)});
+            }
+        }
+    }
+    return result;
+}
+
+struct TagAbi {
+    int32_t header_offset;
+    uint32_t class_shift;
+    uint32_t class_bits;
+    uint32_t size_shift;
+    uint32_t size_bits;
+    uint32_t size_scale;
+};
+struct Allocation {
+    uint32_t tag;
+    TagAbi abi;
+};
+
+inline bool tag_fields_overlap(uint32_t left_shift, uint32_t left_bits,
+    uint32_t right_shift, uint32_t right_bits) {
+    const uint32_t left_end = left_shift + left_bits;
+    const uint32_t right_end = right_shift + right_bits;
+    return left_shift < right_end && right_shift < left_end;
+}
+inline bool valid_tag_abi(const TagAbi &abi) {
+    if (abi.header_offset >= 0 || abi.class_bits == 0 || abi.class_bits > 31
+        || abi.size_bits == 0 || abi.size_bits > 16 || abi.size_scale > 8) return false;
+    // Allocation tags are materialized and consumed through W registers. A
+    // 64-bit UBFX shape would otherwise make the uint32_t extraction truncate
+    // data or invoke an undefined shift.
+    if (abi.class_shift >= 32 || abi.class_bits > 32 - abi.class_shift
+        || abi.size_shift >= 32 || abi.size_bits > 32 - abi.size_shift) return false;
+    return !tag_fields_overlap(abi.class_shift, abi.class_bits,
+        abi.size_shift, abi.size_bits);
+}
+
+inline std::optional<Allocation> allocation(std::span<const CodeRange> ranges,
+    uintptr_t address) {
+    const auto stub = at(ranges, address, 12);
+    const auto tag = materialized_u32(stub, 2);
+    if (!tag || stub.size() < 8 || !is_b(stub[2])) return {};
+    std::optional<int32_t> header;
+    std::optional<std::pair<uint32_t, uint32_t>> class_bits;
+    for (size_t i = 3; i + 1 < stub.size(); ++i) {
+        if (!is_ldur_x(stub[i]) || rn(stub[i]) != 0) continue;
+        const auto bits = ubfx(stub[i + 1], rd(stub[i]), rd(stub[i]));
+        if (bits) {
+            header = memory_offset(stub[i]);
+            class_bits = bits;
+            break;
+        }
+    }
+    const auto allocator_address = branch_target(address + 2 * sizeof(uint32_t), stub[2], false);
+    if (!header || !class_bits || !allocator_address) return {};
+    const auto allocator = at(ranges, *allocator_address, 2);
+    if (allocator.size() != 2) return {};
+    const auto size_bits = ubfx(allocator[0], 2, rd(allocator[0]));
+    const auto scale = size_bits ? lsl_amount(allocator[1], rd(allocator[0])) : std::nullopt;
+    if (!size_bits || !scale) return {};
+    const TagAbi abi{*header, class_bits->first, class_bits->second,
+        size_bits->first, size_bits->second, *scale};
+    if (!valid_tag_abi(abi)) return {};
+    return Allocation{*tag, abi};
+}
+inline uint32_t field_mask(uint32_t bits) {
+    return bits >= 32 ? UINT32_MAX : (uint32_t{1} << bits) - 1;
+}
+inline uint32_t tag_field(uint32_t tag, uint32_t shift, uint32_t bits) {
+    if (bits == 0 || shift >= 32 || bits > 32 - shift) return 0;
+    return (tag >> shift) & field_mask(bits);
+}
+inline uint32_t object_size(uint32_t tag, const TagAbi &abi) {
+    if (!valid_tag_abi(abi)) return 0;
+    return tag_field(tag, abi.size_shift, abi.size_bits) << abi.size_scale;
+}
+inline uint32_t class_id(uint32_t tag, const TagAbi &abi) {
+    if (!valid_tag_abi(abi)) return 0;
+    return tag_field(tag, abi.class_shift, abi.class_bits);
+}
+
+struct ScalarField {
+    uint32_t begin;
+    uint32_t end;
+};
+inline std::optional<ScalarField> scalar_field(int offset, int32_t header_offset,
+    uint32_t size, unsigned width, unsigned alignment) {
+    // Layout publishes field offsets as uint32_t and the assembly consumes
+    // them as unsigned register offsets, so a valid physical location reached
+    // through a negative encoded offset is not representable by this ABI.
+    if (offset < 0 || header_offset >= 0 || width == 0 || alignment == 0
+        || (alignment & (alignment - 1)) != 0) return {};
+    // LDUR/STUR offsets are relative to the tagged pointer. The allocation base
+    // is header_offset bytes before it: encoded +7 with header -1 is byte 8.
+    const int64_t allocation_offset = static_cast<int64_t>(offset) - header_offset;
+    if (allocation_offset < static_cast<int64_t>(sizeof(uint64_t))
+        || allocation_offset > size || allocation_offset % alignment != 0) return {};
+    const auto begin = static_cast<uint32_t>(allocation_offset);
+    if (width > size - begin) return {};
+    return ScalarField{begin, begin + width};
+}
+inline bool scalar_fields_overlap(const ScalarField &left, const ScalarField &right) {
+    return left.begin < right.end && right.begin < left.end;
+}
+template<size_t N>
+inline bool scalar_fields_disjoint(const std::array<ScalarField, N> &fields) {
+    for (size_t left = 0; left < fields.size(); ++left) {
+        for (size_t right = left + 1; right < fields.size(); ++right) {
+            if (scalar_fields_overlap(fields[left], fields[right])) return false;
+        }
+    }
+    return true;
+}
+
+struct Factory {
+    Match body;
+    Allocation allocation;
+    int alpha;
+    int scale;
+    int surface;
+    int recents;
+    uint32_t false_from_null;
+};
+
+inline std::vector<Factory> factories(std::span<const CodeRange> ranges) {
+    std::vector<Factory> result;
+    for (const auto &range : ranges) {
+        for (size_t start = 0; start < range.words.size(); ++start) {
+            if (!is_bl(range.words[start])) continue;
+            const uintptr_t address = range.address + start * sizeof(uint32_t);
+            const auto target = branch_target(address, range.words[start], true);
+            const auto created = target ? allocation(ranges, *target) : std::nullopt;
+            if (!created) continue;
+            const size_t available = std::min<size_t>(40, range.words.size() - start);
+            size_t length = 0;
+            for (size_t i = 1; i < available; ++i) {
+                if (is_ret(range.words[start + i])) {
+                    length = i + 1;
+                    break;
+                }
+            }
+            if (length == 0) continue;
+            const auto body = range.words.subspan(start, length);
+            std::optional<int> alpha;
+            std::optional<int> scale;
+            std::optional<int> surface;
+            std::optional<int> recents;
+            std::optional<uint32_t> false_from_null;
+            for (size_t i = 1; i < body.size(); ++i) {
+                const uint32_t word = body[i];
+                if (is_stur_x(word) && rd(word) == 31 && rn(word) == 0) {
+                    alpha = memory_offset(word);
+                }
+                if (i + 1 < body.size() && is_stur_d(word) && is_stur_d(body[i + 1])
+                    && rn(word) == 0 && rn(body[i + 1]) == 0 && rd(word) == rd(body[i + 1])
+                    && memory_offset(body[i + 1]) == memory_offset(word) + 8) {
+                    scale = memory_offset(word);
+                }
+                if (i + 1 < body.size() && is_ldur_x(word) && rn(word) == 29
+                    && memory_offset(word) < 0 && is_stur_w(body[i + 1])
+                    && rd(body[i + 1]) == rd(word) && rn(body[i + 1]) == 0) {
+                    surface = memory_offset(body[i + 1]);
+                }
+                if (i + 1 < body.size() && is_add_imm_x(word) && rn(word) == 22
+                    && is_stur_w(body[i + 1]) && rd(body[i + 1]) == rd(word)
+                    && rn(body[i + 1]) == 0) {
+                    recents = memory_offset(body[i + 1]);
+                    false_from_null = add_imm(word);
+                }
+            }
+            if (!alpha || !scale || !surface || !recents || !false_from_null) continue;
+            const uint32_t size = object_size(created->tag, created->abi);
+            const auto alpha_field = scalar_field(*alpha, created->abi.header_offset,
+                size, 8, 8);
+            const auto scale_field = scalar_field(*scale, created->abi.header_offset,
+                size, 16, 8);
+            const auto surface_field = scalar_field(*surface, created->abi.header_offset,
+                size, 4, 4);
+            const auto recents_field = scalar_field(*recents, created->abi.header_offset,
+                size, 4, 4);
+            if (!alpha_field || !scale_field || !surface_field || !recents_field
+                || !scalar_fields_disjoint(std::array{
+                    *alpha_field, *scale_field, *surface_field, *recents_field})) continue;
+            result.push_back({{address, body}, *created, *alpha, *scale, *surface,
+                *recents, *false_from_null});
+        }
+    }
+    return result;
+}
+
+struct ScaleCallback {
+    Match body;
+    uintptr_t setter;
+    std::array<int, 2> receiver_fields;
+};
+inline std::vector<ScaleCallback> scale_callbacks(const std::vector<Match> &all_functions) {
+    std::vector<ScaleCallback> result;
+    for (const auto &function : all_functions) {
+        if (function.words.size() < 12 || function.words.size() > 40) continue;
+        std::vector<uintptr_t> targets;
+        std::vector<int> fields;
+        for (size_t i = 0; i < function.words.size(); ++i) {
+            if (const auto target = call_target(function, i)) targets.push_back(*target);
+            if (i + 1 < function.words.size() && is_ldur_w(function.words[i])
+                && is_compressed_pointer_add(function.words[i + 1])
+                && rd(function.words[i]) == rd(function.words[i + 1])) {
+                fields.push_back(memory_offset(function.words[i]));
+            }
+        }
+        if (targets.size() != 2 || targets[0] != targets[1] || fields.size() != 2
+            || fields[0] == fields[1]) continue;
+        result.push_back({function, targets[0], {fields[0], fields[1]}});
+    }
+    return result;
+}
+
+struct BoxUse {
+    uint32_t tag;
+    int header_offset;
+    int value_offset;
+    int source_offset;
+    int receiver_offset;
+};
+inline std::optional<BoxUse> box_before_call(const Match &function, size_t call) {
+    if (call < 3 || call >= function.words.size() || !is_bl(function.words[call])) return {};
+    const uint32_t value_store = function.words[call - 1];
+    const uint32_t header_store = function.words[call - 2];
+    if (!is_stur_d(value_store) || !is_stur_x(header_store)
+        || rn(value_store) != rn(header_store)) return {};
+    const uint32_t tag_reg = rd(header_store);
+    const size_t begin = call > 20 ? call - 20 : 0;
+    std::optional<uint32_t> tag;
+    for (size_t i = begin; i + 1 < call - 2; ++i) {
+        if (const auto value = materialized_u32(function.words.subspan(i), tag_reg)) tag = value;
+    }
+    if (!tag) return {};
+    std::optional<int> source;
+    std::optional<int> receiver;
+    for (size_t i = begin; i < call - 2; ++i) {
+        if (is_ldur_d(function.words[i]) && rd(function.words[i]) == rd(value_store)) {
+            source = memory_offset(function.words[i]);
+        }
+        if (!receiver && i + 1 < call && is_ldur_w(function.words[i])
+            && is_compressed_pointer_add(function.words[i + 1])
+            && rd(function.words[i]) == rd(function.words[i + 1])) {
+            receiver = memory_offset(function.words[i]);
+        }
+    }
+    if (!source || !receiver) return {};
+    return BoxUse{*tag, memory_offset(header_store), memory_offset(value_store),
+        *source, *receiver};
+}
+
+struct SetResolution {
+    Match function;
+    Allocation boxed;
+    uint32_t boxed_value_offset;
+};
+inline std::vector<BoxUse> box_uses(const Match &function, uintptr_t setter) {
+    std::vector<BoxUse> result;
+    for (size_t i = 0; i < function.words.size(); ++i) {
+        const auto target = call_target(function, i);
+        if (!target || *target != setter) continue;
+        if (const auto use = box_before_call(function, i)) result.push_back(*use);
+    }
+    return result;
+}
+inline std::optional<SetResolution> set_relation(const Match &function,
+    const std::vector<BoxUse> &uses, const Factory &factory, const ScaleCallback &scale) {
+    if (uses.size() < 3) return {};
+    const auto same_box = [&](const BoxUse &use) {
+        return use.tag == uses[0].tag && use.header_offset == uses[0].header_offset
+            && use.value_offset == uses[0].value_offset;
+    };
+    if (!std::all_of(uses.begin(), uses.end(), same_box)) return {};
+    const auto has_source = [&](int offset) {
+        return std::any_of(uses.begin(), uses.end(),
+            [&](const BoxUse &use) { return use.source_offset == offset; });
+    };
+    const auto has_receiver = [&](int offset) {
+        return std::any_of(uses.begin(), uses.end(),
+            [&](const BoxUse &use) { return use.receiver_offset == offset; });
+    };
+    if (!has_source(factory.alpha) || !has_source(factory.scale)
+        || !has_source(factory.scale + 8)
+        || !has_receiver(scale.receiver_fields[0])
+        || !has_receiver(scale.receiver_fields[1])) return {};
+    const auto &abi = factory.allocation.abi;
+    const uint32_t size = object_size(uses[0].tag, abi);
+    if (uses[0].header_offset != abi.header_offset
+        || !scalar_field(uses[0].value_offset, abi.header_offset, size, 8, 8)) return {};
+    return SetResolution{function, {uses[0].tag, abi},
+        static_cast<uint32_t>(uses[0].value_offset)};
+}
+
+inline std::vector<uintptr_t> calls(const Match &function, size_t limit = SIZE_MAX) {
+    std::vector<uintptr_t> result;
+    for (size_t i = 0; i < function.words.size() && result.size() < limit; ++i) {
+        if (const auto target = call_target(function, i)) result.push_back(*target);
+    }
+    return result;
+}
+inline uint32_t normalize_relocatable(uint32_t word) {
+    if (is_bl(word) || is_b(word)) return word & 0xfc000000;
     if ((word & 0xff000010) == 0x54000000) return word & ~0x00ffffe0;
     if ((word & 0x7e000000) == 0x34000000) return word & ~0x00ffffe0;
-    if ((word & 0x7e000000) == 0x36000000) return word & ~0x0007ffe0;
     if ((word & 0x1f000000) == 0x11000000) return word & ~0x003ffc00;
     if ((word & 0x3b000000) == 0x39000000) return word & ~0x003ffc00;
     if ((word & 0x3b200c00) == 0x38000000) return word & ~0x001ff000;
     if ((word & 0x1f800000) == 0x12800000) return word & ~0x001fffe0;
     return word;
 }
-struct Shape {
-    size_t words;
-    uint64_t fingerprint;
-    std::array<uint32_t, 4> prefix;
-};
-inline constexpr Shape kScaleShape{20, 0x37571acc0a8a293cULL,
-    {0xa9bf79fd, 0xaa0f03fd, 0xd10001ef, 0xaa0103e3}};
-inline constexpr Shape kAnimateShape{408, 0x995cef99b545a9e3ULL,
-    {0xa9bf79fd, 0xaa0f03fd, 0xd10001ef, 0xf80003a1}};
-inline constexpr Shape kSetShape{205, 0x3d59fd81e6b4ff29ULL,
-    {0xa9bf79fd, 0xaa0f03fd, 0xd10001ef, 0xf80003a1}};
-inline constexpr Shape kParamsShape{199, 0xd711731a2821d813ULL,
-    {0xa9bf79fd, 0xaa0f03fd, 0xd10001ef, 0xaa1603e1}};
-inline constexpr Shape kFactoryShape{21, 0x91e4c216ebc79c09ULL,
-    {0x94000000, 0xf800001f, 0x91400371, 0xfd400220}};
-// EditMode's state-change closure. The callback takes the EditState enum at
-// the top of Dart's x15 stack. Its normalized structure is identical and
-// unique in the reviewed launcher 6179 and 6236 artifacts.
-inline constexpr Shape kEditShape{28, 0xa49ee9840058b944ULL,
-    {0xa9bf79fd, 0xaa0f03fd, 0xd10001ef, 0xf94003a0}};
-
-struct Match {
-    uintptr_t address;
-    std::span<const uint32_t> words;
-};
-inline bool matches(std::span<const uint32_t> words, const Shape &shape) {
-    if (words.size() < shape.words) return false;
-    for (size_t i = 0; i < shape.prefix.size(); ++i) {
-        if (normalize(words[i]) != shape.prefix[i]) return false;
+inline bool shared_dynamic_prelude(const Match &left, const Match &right) {
+    size_t left_end = 0;
+    size_t right_end = 0;
+    unsigned left_calls = 0;
+    unsigned right_calls = 0;
+    while (left_end < left.words.size() && left_calls < 4) {
+        if (is_bl(left.words[left_end])) ++left_calls;
+        ++left_end;
     }
-    uint64_t hash = 0xcbf29ce484222325ULL;
-    for (const auto word : words.first(shape.words)) hash = (hash ^ normalize(word)) * 0x100000001b3ULL;
-    return hash == shape.fingerprint;
+    while (right_end < right.words.size() && right_calls < 4) {
+        if (is_bl(right.words[right_end])) ++right_calls;
+        ++right_end;
+    }
+    if (left_calls != 4 || right_calls != 4 || left_end != right_end) return false;
+    for (size_t i = 0; i < left_end; ++i) {
+        if (normalize_relocatable(left.words[i]) != normalize_relocatable(right.words[i])) return false;
+    }
+    return true;
 }
-inline std::vector<Match> find(std::span<const CodeRange> ranges, const Shape &shape) {
-    std::vector<Match> result;
+inline std::span<const uint32_t> function_cluster(std::span<const CodeRange> ranges,
+    uintptr_t address) {
     for (const auto &range : ranges) {
-        if (range.words.size() < shape.words) continue;
-        for (size_t i = 0; i <= range.words.size() - shape.words; ++i) {
-            if (normalize(range.words[i]) != shape.prefix[0]) continue;
-            const auto words = range.words.subspan(i, shape.words);
-            if (matches(words, shape)) {
-                result.push_back({range.address + i * sizeof(uint32_t), words});
-                if (result.size() > 8) return {}; // Bounded, ambiguous input is unsupported.
+        if (!range.contains(address)) continue;
+        const size_t start = (address - range.address) / sizeof(uint32_t);
+        size_t length = std::min<size_t>(512, range.words.size() - start);
+        for (size_t i = 2; i + 1 < length; ++i) {
+            if (is_dart_prologue(range.words.subspan(start + i))) {
+                length = i;
+                break;
+            }
+        }
+        return range.words.subspan(start, length);
+    }
+    return {};
+}
+inline bool cluster_uses_layout(std::span<const uint32_t> cluster,
+    const Factory &factory, const SetResolution &set) {
+    bool alpha = false;
+    bool scale = false;
+    bool scale_y = false;
+    unsigned boxed_tags = 0;
+    for (size_t i = 0; i < cluster.size(); ++i) {
+        if (is_ldur_d(cluster[i])) {
+            const int offset = memory_offset(cluster[i]);
+            alpha |= offset == factory.alpha;
+            scale |= offset == factory.scale;
+            scale_y |= offset == factory.scale + 8;
+        }
+        if (i + 1 < cluster.size()) {
+            const auto tag = materialized_u32(cluster.subspan(i), rd(cluster[i]));
+            if (tag && *tag == set.boxed.tag) ++boxed_tags;
+        }
+    }
+    return alpha && scale && scale_y && boxed_tags >= 3;
+}
+inline std::optional<Match> animate_function(std::span<const CodeRange> ranges,
+    const std::vector<Match> &all_functions, const Factory &factory,
+    const SetResolution &set) {
+    const Match &set_function = set.function;
+    const auto set_calls = calls(set_function, 4);
+    if (set_calls.size() != 4) return {};
+    std::optional<Match> result;
+    for (const auto &function : all_functions) {
+        if (function.address == set_function.address) continue;
+        if (calls(function, 4) != set_calls
+            || !shared_dynamic_prelude(function, set_function)
+            || !cluster_uses_layout(function_cluster(ranges, function.address), factory, set)) continue;
+        if (result) return {};
+        result = function;
+    }
+    return result;
+}
+
+inline std::optional<Resolution> resolve(std::span<const CodeRange> ranges) {
+    for (size_t left = 0; left < ranges.size(); ++left) {
+        const uintptr_t left_bytes = ranges[left].words.size_bytes();
+        if (left_bytes > UINTPTR_MAX - ranges[left].address) return {};
+        const uintptr_t left_end = ranges[left].address + left_bytes;
+        for (size_t right = left + 1; right < ranges.size(); ++right) {
+            const uintptr_t right_bytes = ranges[right].words.size_bytes();
+            if (right_bytes > UINTPTR_MAX - ranges[right].address) return {};
+            const uintptr_t right_end = ranges[right].address + right_bytes;
+            if (ranges[left].address < right_end && ranges[right].address < left_end) return {};
+        }
+    }
+    const auto all_functions = functions(ranges);
+    const auto all_factories = factories(ranges);
+    const auto all_scales = scale_callbacks(all_functions);
+    std::optional<Resolution> result;
+    for (const auto &scale : all_scales) {
+        for (const auto &function : all_functions) {
+            const auto uses = box_uses(function, scale.setter);
+            if (uses.size() < 3) continue;
+            for (const auto &factory : all_factories) {
+                const auto set = set_relation(function, uses, factory, scale);
+                if (!set) continue;
+                const auto animate = animate_function(ranges, all_functions, factory, *set);
+                if (!animate) continue;
+                const auto &abi = factory.allocation.abi;
+                const uint32_t params_id = class_id(factory.allocation.tag, abi);
+                const uint32_t double_id = class_id(set->boxed.tag, abi);
+                if (params_id == 0 || double_id == 0 || params_id == double_id) continue;
+                Resolution candidate{scale.body.address, animate->address, set->function.address,
+                    {params_id, double_id, abi.header_offset, abi.class_shift,
+                        field_mask(abi.class_bits), static_cast<uint32_t>(factory.alpha),
+                        static_cast<uint32_t>(factory.scale), static_cast<uint32_t>(factory.surface),
+                        static_cast<uint32_t>(factory.recents), set->boxed_value_offset,
+                        factory.false_from_null}};
+                if (result) {
+                    if (same_resolution(*result, candidate)) continue;
+                    return {};
+                }
+                result = candidate;
             }
         }
     }
     return result;
-}
-inline std::span<const uint32_t> at(std::span<const CodeRange> ranges, uintptr_t address, size_t count) {
-    for (const auto &range : ranges) {
-        if (range.contains(address, count)) return range.words.subspan((address - range.address) / 4, count);
-    }
-    return {};
-}
-inline std::optional<uintptr_t> call_target(const Match &match, size_t index) {
-    if (index >= match.words.size()) return {};
-    const auto word = match.words[index];
-    if ((word & 0xfc000000) != 0x94000000) return {};
-    int64_t displacement = word & 0x03ffffff;
-    if ((displacement & 0x02000000) != 0) displacement -= 0x04000000;
-    displacement *= 4;
-    const auto pc = match.address + index * sizeof(uint32_t);
-    if (displacement < 0 && pc < static_cast<uintptr_t>(-displacement)) return {};
-    if (displacement > 0 && pc > UINTPTR_MAX - static_cast<uintptr_t>(displacement)) return {};
-    return displacement < 0 ? pc - static_cast<uintptr_t>(-displacement) : pc + static_cast<uintptr_t>(displacement);
-}
-inline int field_offset(uint32_t word) {
-    int offset = static_cast<int>((word >> 12) & 0x1ff);
-    return offset >= 0x100 ? offset - 0x200 : offset;
-}
-inline std::optional<uint32_t> allocation_tag(std::span<const uint32_t> words, uint32_t reg) {
-    if (words.size() < 2 || (words[0] & 0xffe0001f) != (0xd2800000 | reg)
-        || (words[1] & 0xffe0001f) != (0xf2a00000 | reg)) return {};
-    return ((words[0] >> 5) & 0xffff) | (((words[1] >> 5) & 0xffff) << 16);
-}
-inline bool scalar_field(int offset, uint32_t size, unsigned width) {
-    return offset >= 7 && (offset + 1) % width == 0
-        && static_cast<uint32_t>(offset) < size && width <= size - static_cast<uint32_t>(offset) - 1;
-}
-
-inline std::optional<Resolution> resolve(std::span<const CodeRange> ranges) {
-    const auto anim = find(ranges, kAnimateShape);
-    const auto immediate = find(ranges, kSetShape);
-    const auto params = find(ranges, kParamsShape);
-    const auto factory = find(ranges, kFactoryShape);
-    const auto edit = find(ranges, kEditShape);
-    if (anim.size() != 1 || immediate.size() != 1 || params.size() != 1
-        || factory.size() != 1) return {};
-    const auto allocation = call_target(factory[0], 0);
-    if (!allocation) return {};
-    const auto stub = at(ranges, *allocation, 3);
-    const auto params_tag = allocation_tag(stub, 2);
-    if (!params_tag || stub.size() != 3 || (stub[2] & 0xfc000000) != 0x14000000) return {};
-    const auto double_tag = allocation_tag(params[0].words.subspan(18, 2), 1);
-    if (!double_tag) return {};
-    const auto params_size = ((*params_tag >> 8) & 0xf) * 16;
-    const auto double_size = ((*double_tag >> 8) & 0xf) * 16;
-    // Operand locations are roles in the matched instruction sequence, not
-    // object offsets. Read the offsets from the runtime LDUR/STUR instructions.
-    const int alpha = field_offset(params[0].words[11]);
-    const int scale = field_offset(params[0].words[35]);
-    const int surface = field_offset(params[0].words[131]);
-    const int recents = field_offset(params[0].words[137]);
-    const int double_value = field_offset(params[0].words[21]);
-    if (!scalar_field(alpha, params_size, 8) || !scalar_field(scale, params_size, 8)
-        || !scalar_field(surface, params_size, 4) || !scalar_field(recents, params_size, 4)
-        || !scalar_field(double_value, double_size, 8)) return {};
-    if (alpha == scale || surface == recents || surface <= scale + 7 || recents <= scale + 7) return {};
-    // Independently corroborate constructor stores and setTo parameter reads.
-    const auto &f = factory[0].words;
-    const auto &s = immediate[0].words;
-    if (field_offset(f[1]) != alpha || field_offset(f[4]) != scale
-        || field_offset(f[12]) != surface || field_offset(f[14]) != recents
-        || field_offset(s[51]) != alpha || field_offset(s[69]) != scale
-        || field_offset(s[61]) != double_value) return {};
-    const auto setter = call_target(immediate[0], 62);
-    if (!setter || at(ranges, *setter, 1).empty()) return {};
-    std::optional<Match> scale_match;
-    for (const auto &candidate : find(ranges, kScaleShape)) {
-        if (call_target(candidate, 10) != setter || call_target(candidate, 15) != setter) continue;
-        if (field_offset(candidate.words[7]) != field_offset(s[64])
-            || field_offset(candidate.words[12]) != field_offset(s[82])) continue;
-        if (scale_match) return {};
-        scale_match = candidate;
-    }
-    if (!scale_match) return {};
-    const auto params_id = (*params_tag >> kClassIdShift) & kClassIdMask;
-    const auto double_id = (*double_tag >> kClassIdShift) & kClassIdMask;
-    if (params_id == 0 || double_id == 0 || params_id == double_id) return {};
-    // Edit-mode observation is independent from recents motion. A launcher may
-    // reshape that optional closure without disabling the already verified scale path.
-    const uintptr_t edit_address = edit.size() == 1 ? edit[0].address : 0;
-    return Resolution{scale_match->address, anim[0].address, immediate[0].address, edit_address,
-        {params_id, double_id, static_cast<uint32_t>(alpha), static_cast<uint32_t>(scale),
-        static_cast<uint32_t>(surface), static_cast<uint32_t>(recents), static_cast<uint32_t>(double_value)}};
 }
 } // namespace dock_motion

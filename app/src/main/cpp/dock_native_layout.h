@@ -1,25 +1,36 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 #pragma once
-// Offsets within OUR immutable C++/assembly handoff, never in launcher memory.
-#define DOCK_PARAMS_CID 0
-#define DOCK_DOUBLE_CID 4
-#define DOCK_ALPHA_OFFSET 8
-#define DOCK_SCALE_OFFSET 12
-#define DOCK_SURFACE_OFFSET 16
-#define DOCK_RECENTS_OFFSET 20
-#define DOCK_DOUBLE_VALUE_OFFSET 24
-// Offsets of Dart's canonical bool objects from the null object in x22. These
-// are tagged-object ABI constants, not launcher addresses or heap offsets.
-#define DOCK_DART_FALSE_FROM_NULL 0x20
-#define DOCK_DART_TRUE_FROM_NULL 0x30
+// Every independently mapped Dart runtime gets an immutable bank. Assembly
+// reads each value from a relocated module symbol, so no launcher address,
+// class ID, heap-field offset or Dart tag layout is encoded in this header or
+// in dock_native_motion_arm64.S. A bank is never reused in the same process;
+// callbacks which entered an older generation can therefore finish safely.
+#define DOCK_MOTION_BANKS(X) \
+    X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) \
+    X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15)
+
 #ifndef __ASSEMBLER__
-#include "dock_native_resolver.h"
-static_assert(offsetof(dock_motion::Layout, params_class_id) == DOCK_PARAMS_CID);
-static_assert(offsetof(dock_motion::Layout, double_class_id) == DOCK_DOUBLE_CID);
-static_assert(offsetof(dock_motion::Layout, alpha_offset) == DOCK_ALPHA_OFFSET);
-static_assert(offsetof(dock_motion::Layout, scale_offset) == DOCK_SCALE_OFFSET);
-static_assert(offsetof(dock_motion::Layout, surface_offset) == DOCK_SURFACE_OFFSET);
-static_assert(offsetof(dock_motion::Layout, recents_offset) == DOCK_RECENTS_OFFSET);
-static_assert(offsetof(dock_motion::Layout, double_value_offset) == DOCK_DOUBLE_VALUE_OFFSET);
-extern "C" dock_motion::Layout dock_motion_layout;
+#include <cstdint>
+extern "C" {
+#define DECLARE_DOCK_MOTION_BANK(bank) \
+    extern uint32_t dock_params_class_id_##bank; \
+    extern uint32_t dock_double_class_id_##bank; \
+    extern int32_t dock_tagged_header_offset_##bank; \
+    extern uint32_t dock_class_id_shift_##bank; \
+    extern uint32_t dock_class_id_mask_##bank; \
+    extern uint32_t dock_alpha_offset_##bank; \
+    extern uint32_t dock_scale_offset_##bank; \
+    extern uint32_t dock_surface_offset_##bank; \
+    extern uint32_t dock_recents_offset_##bank; \
+    extern uint32_t dock_double_value_offset_##bank; \
+    extern uint32_t dock_false_from_null_##bank; \
+    extern void *dock_motion_scale_original_##bank; \
+    extern void *dock_motion_anim_original_##bank; \
+    extern void *dock_motion_set_original_##bank; \
+    void dock_motion_scale_entry_##bank(); \
+    void dock_motion_anim_entry_##bank(); \
+    void dock_motion_set_entry_##bank();
+DOCK_MOTION_BANKS(DECLARE_DOCK_MOTION_BANK)
+#undef DECLARE_DOCK_MOTION_BANK
+}
 #endif

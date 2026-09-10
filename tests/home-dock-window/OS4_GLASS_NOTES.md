@@ -193,3 +193,44 @@ in the separated-role build, not just the offscreen smoke test. It does not
 independently verify the system hook's final compositor state or visible glass
 refraction; visual confirmation is still pending. The scoped process log read
 returned no entries, so it provides no additional rendering evidence.
+
+## Superseding preset: match the folder icon glass
+
+The user's current target is the soft glass the launcher draws behind a folder
+**icon**. This supersedes the Control Center card of the section above; it is not
+the expanded folder panel either. The producer is
+`FolderBlurUtils.buildFolderGlass` (libapp.so, offline sample only; Dart object
+offsets are never runtime addresses).
+
+Producer/call chain confirmed offline:
+
+1. `FolderBlurUtils.buildFolderGlass` reads `WallpaperGetxController`
+   (`safeAppliedLightWallpaper`), cross-checked against
+   `LauncherStateManager._hasAppliedLightWallpaper`.
+2. A light wallpaper selects `Glass_Common_Medium_Thin_High`; otherwise
+   `Glass_Common_Medium_Thin_Low`. **This is wallpaper brightness, not
+   `Configuration.UI_MODE_NIGHT_YES`.**
+3. `WallpaperUtils.hasAppliedLightWallpaper` reads the wallpaper colour hints and
+   tests the low bit (`& 1 == 1`), i.e. "supports dark text".
+4. The token carries its own dual blur radii (36/500) and 42 floats.
+
+`DockGlassPreset` now carries the two folder tokens and radii.
+`DockGlassHost.applyMaterial` resolves the brightness on every (re)apply by
+reading `WallpaperManager.getWallpaperColors(FLAG_SYSTEM).getColorHints() & 1`,
+so the material follows a wallpaper change instead of being frozen at host
+creation. `probe()` reports "not ready" while the resolved bit differs from the
+one the live material was built from, which routes the launcher through the
+existing `refresh()` path. `entry.dark` is retained only for the fallback tint
+and diagnostics; it no longer selects the glass.
+
+The regression test pins `Arrays.hashCode` `-616200191` (Medium_Thin_Low) and
+`-1650047496` (Medium_Thin_High), the shared field groups, and the
+wallpaper-branched refractive index and background field.
+
+Open, unverified items: the Flutter `ImageFilter` sigma values and the HWUI
+`setMiGlassBlurRadius` unit are **not** proven to be the same blur unit, so 36/500
+is carried across unchanged and must be confirmed on-device. Matching parameters
+alone does not establish pixel-identical rendering: the Dock is produced by the
+same HWUI glass API but under different geometry and input than a folder icon, and
+the whole chain still needs on-device visual confirmation.
+

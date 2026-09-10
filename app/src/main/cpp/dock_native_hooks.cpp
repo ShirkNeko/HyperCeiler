@@ -82,6 +82,13 @@ unsigned settling_scans = 0;
 unsigned scan_cooldown = 0;
 bool capacity_reported = false;
 
+/**
+ * Counts every time a slot was refused or disarmed because its continuation pointer was
+ * missing, i.e. every crash that the tail-branch guard prevented. Surfaced in the pipeline
+ * heartbeat so a guarded event stays visible after logcat has rotated the one-shot line away.
+ */
+std::atomic<uint64_t> dock_motion_guard_events{0};
+
 struct ResolvedInstance {
     dock_motion::Resolution resolution;
     std::vector<dock_motion::ExecutableMapping> mappings;
@@ -673,13 +680,47 @@ HookBank make_bank(size_t index, const ResolvedInstance &instance) {
     }}};
 }
 
+/** Write raw bytes back into a code page, restoring its original protection afterwards. */
+bool write_code_words(uintptr_t address, const PatchWords &words) {
+    const uintptr_t page = address - address % host_page_size();
+    const size_t length = static_cast<size_t>(address + kPatchBytes - page);
+    void *base = reinterpret_cast<void *>(page);
+    if (mprotect(base, length, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
+    std::memcpy(reinterpret_cast<void *>(address), words.data(), kPatchBytes);
+    __builtin___clear_cache(reinterpret_cast<char *>(address),
+        reinterpret_cast<char *>(address + kPatchBytes));
+    return mprotect(base, length, PROT_READ | PROT_EXEC) == 0;
+}
+
 bool install_slot(HookSlot &slot) {
     if (slot.registered) return true;
+    if (hook_function == nullptr || slot.original == nullptr) return false;
     PatchWords before{};
-    if (hook_function == nullptr || !stable_read(slot, before)
-        || before != slot.original_words) return false;
+    if (!stable_read(slot, before) || before != slot.original_words) return false;
+
+    // The replacement trampoline ends in `br x16`, where x16 is the continuation the hook
+    // library hands back through this out-parameter. A null continuation is an unconditional
+    // jump to address 0, so a slot must never be left armed without one. Re-arming an address
+    // the library still owns can fail *after* it has already written the out-parameter, so the
+    // previously validated stub is remembered and restored on failure instead of being lost.
+    void *previous = *slot.original;
     if (hook_function(reinterpret_cast<void *>(slot.address), slot.replacement,
-            slot.original) != 0) return false;
+            slot.original) != 0) {
+        if (*slot.original == nullptr) *slot.original = previous;
+        return false;
+    }
+    if (*slot.original == nullptr) {
+        // The library reported success but produced no continuation. Put the untouched
+        // prologue back so the Dart function keeps running normally instead of branching to
+        // null, and refuse the slot: a silent follow loss is strictly better than a crash.
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+            "motion hook refused address=0x%llx continuation missing; prologue restored",
+            static_cast<unsigned long long>(slot.address));
+        dock_motion_guard_events.fetch_add(1, std::memory_order_relaxed);
+        write_code_words(slot.address, before);
+        *slot.original = previous;
+        return false;
+    }
     slot.registered = true;
     PatchWords after{};
     if (stable_read(slot, after) && after != slot.original_words) {
@@ -700,14 +741,18 @@ bool install_slot(HookSlot &slot) {
  */
 bool restore_patch_words(HookSlot &slot) {
     if (!slot.patch_known) return false;
-    const uintptr_t page = slot.address - slot.address % host_page_size();
-    const size_t length = static_cast<size_t>(slot.address + kPatchBytes - page);
-    void *base = reinterpret_cast<void *>(page);
-    if (mprotect(base, length, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
-    std::memcpy(reinterpret_cast<void *>(slot.address), slot.patch_words.data(), kPatchBytes);
-    __builtin___clear_cache(reinterpret_cast<char *>(slot.address),
-        reinterpret_cast<char *>(slot.address + kPatchBytes));
-    if (mprotect(base, length, PROT_READ | PROT_EXEC) != 0) return false;
+    // Re-arming is only ever safe while the continuation the trampoline branches to exists.
+    // The library normally keeps its stub for process life, but a re-hook attempt can clear
+    // the out-parameter; writing the patch back then would turn every later call into a jump
+    // to address 0. Leaving the prologue untouched keeps the Dart function runnable.
+    if (slot.original == nullptr || *slot.original == nullptr) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+            "motion hook re-arm skipped address=0x%llx continuation missing",
+            static_cast<unsigned long long>(slot.address));
+        dock_motion_guard_events.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (!write_code_words(slot.address, slot.patch_words)) return false;
     // The live words are the recorded patch again, so the bank verifies clean from here on.
     slot.registered = true;
     return true;
@@ -732,6 +777,20 @@ bool ensure_slots_live(HookBank &bank) {
     for (const size_t index : order) {
         auto &slot = bank.slots[index];
         if (slot.registered) {
+            // A live patch whose continuation vanished would branch to address 0 on the next
+            // call. Disarm it (restore the untouched prologue) before anything else: a channel
+            // that stays down is recoverable, a null branch is not.
+            if (slot.original == nullptr || *slot.original == nullptr) {
+                if (write_code_words(slot.address, slot.original_words)) {
+                    __android_log_print(ANDROID_LOG_ERROR, kTag,
+                        "motion hook disarmed bank=%zu slot=%zu; continuation missing",
+                        bank.index, index);
+                }
+                dock_motion_guard_events.fetch_add(1, std::memory_order_relaxed);
+                slot.registered = false;
+                slot.patch_known = false;
+                return false;
+            }
             PatchWords observed{};
             if (!stable_read(slot, observed)) return false;
             if (slot.patch_known && observed == slot.patch_words) continue;
@@ -781,6 +840,7 @@ void report_pipeline(bool healthy) {
     static uint64_t entry = 0;
     static uint64_t publish = 0;
     static uint64_t callbacks = 0;
+    static uint64_t guard = 0;
     uint64_t now = 0;
     if (!monotonic_ns(now)) return;
     if (next_ns == 0) next_ns = now + kPipelineReportNs;
@@ -789,19 +849,23 @@ void report_pipeline(bool healthy) {
     const uint64_t current_entry = dock_motion_entry_hits.load(std::memory_order_relaxed);
     const uint64_t current_publish = dock_motion_publish_hits.load(std::memory_order_relaxed);
     const uint64_t current_callbacks = dock_motion_active_callbacks.load(std::memory_order_relaxed);
+    const uint64_t current_guard = dock_motion_guard_events.load(std::memory_order_relaxed);
     const uint32_t current_subscribed = dock_motion_subscribed.load(std::memory_order_relaxed);
     __android_log_print(ANDROID_LOG_INFO, kTag,
-        "motion pipeline subscribed=%u healthy=%d banks=%zu entry=%llu(+%llu) publish=%llu(+%llu) callbacks=%llu(+%llu)",
+        "motion pipeline subscribed=%u healthy=%d banks=%zu entry=%llu(+%llu) publish=%llu(+%llu) callbacks=%llu(+%llu) guard=%llu(+%llu)",
         current_subscribed, healthy ? 1 : 0, hook_banks.size(),
         static_cast<unsigned long long>(current_entry),
         static_cast<unsigned long long>(current_entry - entry),
         static_cast<unsigned long long>(current_publish),
         static_cast<unsigned long long>(current_publish - publish),
         static_cast<unsigned long long>(current_callbacks),
-        static_cast<unsigned long long>(current_callbacks - callbacks));
+        static_cast<unsigned long long>(current_callbacks - callbacks),
+        static_cast<unsigned long long>(current_guard),
+        static_cast<unsigned long long>(current_guard - guard));
     entry = current_entry;
     publish = current_publish;
     callbacks = current_callbacks;
+    guard = current_guard;
 }
 
 bool bank_healthy(HookBank &bank) {
@@ -810,6 +874,9 @@ bool bank_healthy(HookBank &bank) {
     for (size_t i = 0; i < bank.slots.size(); ++i) {
         auto &slot = bank.slots[i];
         if (!slot.registered) return false;
+        // The replacement tail-branches through this pointer; a missing continuation is a jump
+        // to address 0, so the bank is not healthy until ensure_slots_live() repairs or disarms it.
+        if (slot.original == nullptr || *slot.original == nullptr) return false;
         if (!slot.patch_known) {
             if (observed[i] == slot.original_words) return false;
             slot.patch_words = observed[i];

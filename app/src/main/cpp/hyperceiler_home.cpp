@@ -241,7 +241,7 @@ jint native_status() {
 }  // namespace
 
 extern "C" JNIEXPORT jint JNICALL
-Java_com_sevtinge_hyperceiler_libhook_rules_home_os4_NativeHomeHooks_nativeConfigure(
+Java_com_sevtinge_hyperceiler_libhook_rules_home_other_NativeHomeHooksOS4_nativeConfigure(
     JNIEnv *, jobject, jboolean high_device_level, jboolean disable_prestart,
     jboolean soft_glass) {
     g_high_device_level.store(high_device_level == JNI_TRUE, std::memory_order_relaxed);
@@ -257,7 +257,7 @@ Java_com_sevtinge_hyperceiler_libhook_rules_home_os4_NativeHomeHooks_nativeConfi
 }
 
 extern "C" JNIEXPORT jint JNICALL
-Java_com_sevtinge_hyperceiler_libhook_rules_home_os4_NativeHomeHooks_nativeStatus(
+Java_com_sevtinge_hyperceiler_libhook_rules_home_other_NativeHomeHooksOS4_nativeStatus(
     JNIEnv *, jobject) {
     return native_status();
 }

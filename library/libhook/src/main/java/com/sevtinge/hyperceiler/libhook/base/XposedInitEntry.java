@@ -31,7 +31,7 @@ import com.sevtinge.hyperceiler.common.log.XposedLog;
 import com.sevtinge.hyperceiler.common.utils.PrefsBridge;
 import com.sevtinge.hyperceiler.libhook.app.CorePatch.CorePatch;
 import com.sevtinge.hyperceiler.libhook.rules.systemframework.others.FlagSecure;
-import com.sevtinge.hyperceiler.libhook.rules.home.os4.NativeHomeHooks;
+import com.sevtinge.hyperceiler.libhook.rules.home.other.NativeHomeHooksOS4;
 import com.sevtinge.hyperceiler.libhook.safecrash.CrashMonitor;
 import com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils;
 import com.sevtinge.hyperceiler.libhook.utils.api.ThreadPoolManager;
@@ -230,7 +230,7 @@ public class XposedInitEntry extends XposedModule {
         try {
             Log.i(LAUNCHER_ENTRY_TAG,
                 "stage=module-entry pkg=" + LAUNCHER_PACKAGE + " process=" + name);
-            NativeHomeHooks.INSTANCE.ensureLoadedFromModuleEntry(name);
+            NativeHomeHooksOS4.INSTANCE.ensureLoadedFromModuleEntry(name);
         } catch (Throwable t) {
             Log.w(LAUNCHER_ENTRY_TAG, "stage=module-entry probe failed", t);
         }

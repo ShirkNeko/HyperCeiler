@@ -217,6 +217,10 @@ bool safe_read(uintptr_t address, std::span<std::byte> destination) {
     return true;
 }
 
+// True when every entry of `subset` is still present, verbatim, in `set`. Image
+// discovery wants exactly this conservative meaning: a VMA split or merge makes
+// the subset test fail, which only forfeits a match - it never asserts that
+// live code disappeared.
 bool mapping_subset(const std::vector<dock_motion::ExecutableMapping> &subset,
     const std::vector<dock_motion::ExecutableMapping> &set) {
     return std::ranges::all_of(subset, [&](const auto &mapping) {
@@ -811,52 +815,41 @@ bool bank_healthy(HookBank &bank) {
         });
 }
 
-/**
- * Index of a bank whose executable image is no longer mapped, or kBankSymbols.size()
- * when every bank still owns live code. Recycling one is safe because an unmapped
- * generation can never run its replacement again, so republishing that bank's layout
- * symbols cannot change the behaviour of anything still executing.
- */
-size_t dead_bank_index() {
-    for (size_t index = 0; index < hook_banks.size(); ++index) {
-        if (mapping_subset(hook_banks[index].mappings, last_inventory)) continue;
-        return index;
-    }
-    return kBankSymbols.size();
-}
-
 bool add_instance(const ResolvedInstance &instance) {
     if (std::ranges::any_of(hook_banks,
             [&](const auto &bank) { return same_instance(bank, instance); })) return false;
     size_t index = hook_banks.size();
-    bool recycled = false;
     if (index >= kBankSymbols.size()) {
-        // Every bank is immutable while its image is mapped, but a generation whose
-        // executable ranges are no longer mapped can never fire again. Reclaim one of
-        // those instead of refusing forever: refusing used to freeze the whole chain
-        // once 16 generations had been consumed, until the desktop was restarted.
-        index = dead_bank_index();
-        if (index >= kBankSymbols.size()) {
-            if (!capacity_reported) {
-                capacity_reported = true;
-                __android_log_print(ANDROID_LOG_WARN, kTag,
-                    "motion runtime bank capacity reached; keeping existing generations");
-            }
-            return false;
+        // Fail closed. Every bank stays bound to the generation that installed it for
+        // the whole process lifetime (the contract in dock_native_layout.h), so a
+        // callback that entered an older generation can always finish safely.
+        //
+        // Recycling was considered and deliberately rejected. Judging bank liveness by
+        // exact mapping-inventory identity is a bet: the kernel splits and merges VMAs
+        // (an mprotect inside a segment splits the /proc/self/maps entry - including
+        // splits caused by this module's own inline-patch protection flips), and a
+        // split or merge makes a *live* generation fail the exact-match test. Recycling
+        // that bank republishes its layout symbols under a new generation while the old
+        // replacement is still executing and still reading them: a memory-safety
+        // hazard, not a performance trade-off. The scenario needs 16 generations in one
+        // process before it can arise, so refusing is the cheap side of the trade.
+        if (!capacity_reported) {
+            capacity_reported = true;
+            __android_log_print(ANDROID_LOG_WARN, kTag,
+                "motion runtime bank capacity reached; refusing new generations (fail closed)");
         }
-        recycled = true;
+        return false;
     }
     // Publish the layout before installing: the replacement reads these symbols.
     publish_layout(index, instance.resolution.layout);
     HookBank replacement = make_bank(index, instance);
-    if (recycled) hook_banks[index] = std::move(replacement);
-    else hook_banks.push_back(std::move(replacement));
+    hook_banks.push_back(std::move(replacement));
     auto &bank = hook_banks[index];
     const bool installed = ensure_slots_live(bank.slots, slot_host(), kInstallOrder)
         && bank_healthy(bank);
     __android_log_print(installed ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, kTag,
-        "motion runtime bank=%zu recycled=%d paramsCID=%u doubleCID=%u install=%s",
-        index, recycled ? 1 : 0, instance.resolution.layout.params_class_id,
+        "motion runtime bank=%zu paramsCID=%u doubleCID=%u install=%s",
+        index, instance.resolution.layout.params_class_id,
         instance.resolution.layout.double_class_id, installed ? "complete" : "partial");
     return installed;
 }

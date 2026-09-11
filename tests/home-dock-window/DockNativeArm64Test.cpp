@@ -12,8 +12,8 @@
 #include <initializer_list>
 #include <sys/eventfd.h>
 #include <unistd.h>
-#include "../../app/src/main/cpp/dock_native_layout.h"
-#include "../../app/src/main/cpp/dock_native_resolver.h"
+#include "../../app/src/main/cpp/targets/home/dock_native_layout.h"
+#include "../../app/src/main/cpp/targets/home/dock_native_resolver.h"
 
 extern "C" {
 void dock_test_trampoline();

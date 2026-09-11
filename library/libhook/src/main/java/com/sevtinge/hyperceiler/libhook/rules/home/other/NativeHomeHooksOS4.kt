@@ -40,8 +40,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * The two `external` functions below are resolved by their JNI symbol names, which encode this
  * class's fully qualified name. Renaming or moving this object therefore requires updating the
  * matching `Java_com_sevtinge_hyperceiler_libhook_rules_home_other_NativeHomeHooksOS4_native*`
- * definitions in `app/src/main/cpp/hyperceiler_home.cpp`. There is no `RegisterNatives` table to
- * keep the two in sync automatically.
+ * definitions in `app/src/main/cpp/targets/home/hyperceiler_home.cpp`. There is no
+ * `RegisterNatives` table to keep the two in sync automatically.
  */
 @Keep
 object NativeHomeHooksOS4 {
@@ -54,8 +54,8 @@ object NativeHomeHooksOS4 {
 
     /** Unconditional logcat tag: these stages must be readable even when prefs/log level are broken. */
     private const val LOG_TAG = "HyperCeiler.NativeHome"
-    private const val LIBRARY = "hyperceiler_home"
-    private const val LIBRARY_FILE = "libhyperceiler_home.so"
+    private const val LIBRARY = "HyperCeilerNative"
+    private const val LIBRARY_FILE = "libHyperCeilerNative.so"
     private const val PACKAGE = "com.sevtinge.hyperceiler"
 
     private val loadStarted = AtomicBoolean()
@@ -119,7 +119,7 @@ object NativeHomeHooksOS4 {
      * `System.loadLibrary` resolves through the namespace LSPosed prepared for the module. When
      * that namespace is missing (for example when an in-place reinstall invalidated the module APK
      * path the framework still had cached), fall back to the absolute library path of the installed
-     * module. Both forms end in `/libhyperceiler_home.so`, which is what the framework matches to
+     * module. Both forms end in `/libHyperCeilerNative.so`, which is what the framework matches to
      * decide whether to call `native_init`.
      */
     private fun loadLibrary() {

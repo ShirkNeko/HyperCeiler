@@ -16,7 +16,7 @@ consulted, and nothing in that repository was modified).
 | `got_hook_backend.h` | Ported from `lsposed_hook_backend.cpp` (`WritePointer`, `CollectRelocationSlots`, `PltHookRaw`, RELRO handling, all-or-nothing rollback). Deltas: parameterized by an `ElfImage` instead of hard-coded launcher module identities; health model aligned with the project's hook bank semantics. |
 | `page_guard.h` | Ported from `lsposed_hook_backend.cpp` (`AddProtectedPage`, `GuardedMadvise`, guard state machine). Deltas: the hooked library (originally the HyperOS Flutter runtime) is a caller decision; the guard is an optional policy, not a mandatory dependency. |
 | `arm64_decode.h` | ADRP/ADD-pair, PLT-stub and conditional-branch decoding derived from `runtime_profile_resolver.cpp`; register/load-store/bitfield decoders abstracted from this project's own Dart resolver. |
-| `inline_hook_backend.h` | The `NativeAPIEntries` (hookFunc/unhookFunc) boundary shape follows `native_api.h`; the null-continuation refusal and rollback logic come from this project's `dock_native_hooks.cpp`. |
+| `inline_hook_backend.h` | The `NativeAPIEntries` (hookFunc/unhookFunc) boundary shape follows `native_api.h`; the null-continuation refusal and rollback logic come from this project's `targets/home/dock_native_hooks.cpp`. |
 | `nhk_base.h` | `AddOverflows` / bounded-range discipline follows the source's overflow-guard style. |
 
 ## License text

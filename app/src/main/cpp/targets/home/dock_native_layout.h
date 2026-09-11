@@ -5,6 +5,9 @@
 // class ID, heap-field offset or Dart tag layout is encoded in this header or
 // in dock_native_motion_arm64.S. A bank is never reused in the same process;
 // callbacks which entered an older generation can therefore finish safely.
+// When all 16 banks are consumed the install path fails closed and refuses
+// new generations: recycling would republish a bank's layout symbols while
+// callbacks of the previous generation may still be in flight.
 #define DOCK_MOTION_BANKS(X) \
     X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) \
     X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15)

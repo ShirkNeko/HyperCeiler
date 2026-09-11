@@ -10,7 +10,7 @@
  * With a fixture supplied, a read failure, a resolver miss or a broken
  * contract is a FAILURE - a regression must never be reported as a skip.
  */
-#include "../../app/src/main/cpp/dock_native_resolver.h"
+#include "../../app/src/main/cpp/targets/home/dock_native_resolver.h"
 #include "../../app/src/main/cpp/nativehook/resolver.h"
 
 #include <cstdio>

@@ -8,8 +8,8 @@
 // keeps sibling libraries out of the inventory, and - when a real container is
 // supplied as an argument - the complete path from container offsets to the
 // semantically resolved motion targets.
-#include "../../app/src/main/cpp/dock_native_resolver.h"
-#include "../../app/src/main/cpp/dock_native_runtime.h"
+#include "../../app/src/main/cpp/targets/home/dock_native_resolver.h"
+#include "../../app/src/main/cpp/targets/home/dock_native_runtime.h"
 
 #include <cassert>
 #include <cstring>

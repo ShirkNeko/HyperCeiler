@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
-#include "../../app/src/main/cpp/dock_native_runtime.h"
+#include "../../app/src/main/cpp/targets/home/dock_native_runtime.h"
 
 #include <array>
 #include <cassert>

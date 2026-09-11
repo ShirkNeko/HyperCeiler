@@ -23,6 +23,9 @@ public final class DockGlassRetryPolicy {
     public static final int BACKGROUND_CHECKS = 20;
     private static final long[] DELAYS_MS = {2000, 4000, 8000, 16000, 30000};
 
+    /** Faster than the compatibility ladder: a package swap is expected to heal in seconds. */
+    private static final long[] DEPENDENCY_DELAYS_MS = {1000, 2000, 4000, 8000, 16000, 30000};
+
     private DockGlassRetryPolicy() {}
 
     public static long delayAfterFailure(int failedAttempts) {
@@ -49,5 +52,22 @@ public final class DockGlassRetryPolicy {
             int consecutiveFailures, boolean wasReady, boolean previouslyReady) {
         if (wasReady) return 0;
         return delayAfterFailure(consecutiveFailures, previouslyReady);
+    }
+
+    /**
+     * {@code PackageManager} briefly could not resolve the HyperCeiler package, typically
+     * because it was being replaced by an in-place upgrade.
+     *
+     * <p>This is transient and unrelated to framework compatibility, so it never exhausts:
+     * giving up would strand a ticket that had merely raced an install and make a launcher
+     * restart the only way to bring native glass back. The cadence is capped at 30s instead,
+     * which keeps a stuck outage from turning into a hot retry loop.
+     */
+    public static long delayAfterDependencyUnavailable(int unavailableFailures) {
+        if (unavailableFailures < 1) return DEPENDENCY_DELAYS_MS[0];
+        if (unavailableFailures <= DEPENDENCY_DELAYS_MS.length) {
+            return DEPENDENCY_DELAYS_MS[unavailableFailures - 1];
+        }
+        return DEPENDENCY_DELAYS_MS[DEPENDENCY_DELAYS_MS.length - 1];
     }
 }

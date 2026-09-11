@@ -2,6 +2,9 @@
 #include "dock_native_layout.h"
 #include "dock_native_resolver.h"
 #include "dock_native_runtime.h"
+#include "nativehook/got_hook_backend.h"
+#include "nativehook/hook_bank.h"
+#include "nativehook/inline_hook_backend.h"
 
 #include <android/log.h>
 #include <algorithm>
@@ -66,6 +69,13 @@ constexpr size_t kTargetCount = 3;
 constexpr size_t kPatchBytes = 4 * sizeof(uint32_t);
 constexpr unsigned kInventorySettlingScans = 3;
 constexpr unsigned kScanCooldownChecks = 4;
+
+// Defined after the maintenance loop; the loop calls it once per pass.
+void maybe_install_madvise_guard();
+// Defined with the page-lifetime policy; used by the slot host as protect_range.
+bool protect_patch_range(uintptr_t address, size_t bytes);
+// Bounded retries for the page-lifetime guard before it reports unavailable.
+constexpr uint32_t kMadviseGuardMaxAttempts = 8;
 using Hook = int (*)(void *, void *, void **);
 using Unhook = int (*)(void *);
 using PatchWords = std::array<uint32_t, kPatchBytes / sizeof(uint32_t)>;
@@ -73,6 +83,7 @@ using TargetAddresses = std::array<uintptr_t, kTargetCount>;
 using TargetSources = std::array<dock_motion::CodeSource, kTargetCount>;
 
 Hook hook_function = nullptr;
+Unhook unhook_function = nullptr;
 std::atomic_bool started{false};
 std::atomic_bool worker_alive{false};
 std::atomic_bool runtime_ready{false};
@@ -94,18 +105,17 @@ struct ResolvedInstance {
     std::vector<dock_motion::ExecutableMapping> mappings;
     TargetSources sources;
     std::array<PatchWords, kTargetCount> original_words;
+    // Contract-shaped resolver output (nativehook/resolver.h): the same three
+    // inline points plus the evidence that justified them. `targets[i].address`
+    // is verified against `original_words` before the bank is built, so the
+    // contract cannot drift from the runtime's view.
+    std::array<nhk::ResolvedTarget, kTargetCount> targets;
+    nhk::ResolverEvidence evidence;
 };
 
-struct HookSlot {
-    uintptr_t address;
-    void *replacement;
-    void **original;
-    dock_motion::CodeSource source;
-    PatchWords original_words;
-    PatchWords patch_words{};
-    bool registered = false;
-    bool patch_known = false;
-};
+// Slot lifecycle lives in the shared NativeHookRuntime (nativehook/hook_bank.h);
+// the dock only names its three targets and publishes the per-bank layout.
+using HookSlot = nhk::InlineSlot<kPatchBytes / sizeof(uint32_t)>;
 
 struct HookBank {
     size_t index;
@@ -257,23 +267,7 @@ constexpr size_t kElfProbeBytes = 64 + 128 * 56;
 
 std::vector<ContainerProbe> container_probes;
 
-uint64_t host_page_size() {
-    const long page = sysconf(_SC_PAGESIZE);
-    return page > 0 ? static_cast<uint64_t>(page) : 4096;
-}
-
-uint64_t page_down(uint64_t value) {
-    const uint64_t page = host_page_size();
-    return value - value % page;
-}
-
-uint64_t page_up(uint64_t value) {
-    const uint64_t page = host_page_size();
-    const uint64_t remainder = value % page;
-    return remainder == 0 ? value : value + (page - remainder);
-}
-
-/** Slot lookup by index: probing appends, so references would not stay valid. */
+/** Deduplication slot for a container probe, keyed by path and inode. */
 size_t probe_slot(const std::string &path, uint64_t inode) {
     for (size_t index = 0; index < container_probes.size(); ++index) {
         const auto &probe = container_probes[index];
@@ -557,13 +551,14 @@ bool stable_read(const TargetAddresses &locations, const TargetSources &expected
             == dock_motion::MappingState::same;
 }
 
-bool stable_read(const HookSlot &slot, PatchWords &words) {
-    const std::array<uintptr_t, 1> location{slot.address};
-    const std::array<dock_motion::CodeSource, 1> expected{slot.source};
+bool stable_read(uintptr_t address, const dock_motion::CodeSource &source,
+    PatchWords &words) {
+    const std::array<uintptr_t, 1> location{address};
+    const std::array<dock_motion::CodeSource, 1> expected{source};
     const auto before = current_mappings();
     if (!before || dock_motion::mapping_state(*before, location, expected, kPatchBytes)
             != dock_motion::MappingState::same) return false;
-    if (!safe_read(slot.address, std::as_writable_bytes(std::span(&words, 1)))) return false;
+    if (!safe_read(address, std::as_writable_bytes(std::span(&words, 1)))) return false;
     const auto after = current_mappings();
     return after && dock_motion::mapping_state(*after, location, expected, kPatchBytes)
             == dock_motion::MappingState::same;
@@ -610,12 +605,20 @@ std::optional<ResolvedInstance> resolve_generation(
             report_resolution(mappings, "copy");
             return {};
         }
-        const auto resolution = dock_motion::resolve(owned->ranges);
-        if (!resolution) {
+        // The generation's load bias turns the resolver's contract-shaped RVAs
+        // back into runtime addresses (they must round-trip onto the same
+        // mapping, which the source check below proves).
+        uint64_t load_bias = 0;
+        if (const auto key = dock_motion::generation_key(mappings.front())) {
+            load_bias = key->load_bias;
+        }
+        const auto targets = dock_motion::resolve_hook_targets(owned->ranges, load_bias);
+        if (!targets) {
             report_resolution(mappings, "resolve");
             return {};
         }
-        const auto locations = addresses(*resolution);
+        const auto &resolution = targets->resolution;
+        const auto locations = addresses(resolution);
         if (!distinct_targets(locations)) {
             report_resolution(mappings, "distinct");
             return {};
@@ -637,8 +640,17 @@ std::optional<ResolvedInstance> resolve_generation(
                 report_resolution(mappings, "words");
                 return {};
             }
+            // The contract's original words must describe the same prologue the
+            // validated live read produced; anything else is a resolver bug.
+            const auto &declared = targets->targets[i].original_words;
+            if (declared.size() != originals[i].size()
+                || !std::equal(declared.begin(), declared.end(), originals[i].begin())) {
+                report_resolution(mappings, "contract");
+                return {};
+            }
         }
-        return ResolvedInstance{*resolution, mappings, target_sources, originals};
+        return ResolvedInstance{resolution, mappings, target_sources, originals,
+            targets->targets, targets->evidence};
     } catch (...) {
         report_resolution(mappings, "exception");
         return {};
@@ -692,132 +704,51 @@ bool write_code_words(uintptr_t address, const PatchWords &words) {
     return mprotect(base, length, PROT_READ | PROT_EXEC) == 0;
 }
 
-bool install_slot(HookSlot &slot) {
-    if (slot.registered) return true;
-    if (hook_function == nullptr || slot.original == nullptr) return false;
-    PatchWords before{};
-    if (!stable_read(slot, before) || before != slot.original_words) return false;
+// ---------------------------------------------------------------------------
+// Slot lifecycle through the shared NativeHookRuntime.
+//
+// install_slot / restore_patch_words / ensure_slots_live / health moved into
+// nativehook/hook_bank.h so Rust and C targets drive the same state machine.
+// The dock contributes only the memory accessors, the logging format and the
+// guard counter below; the invariants (continuation never null, foreign edits
+// untouched, re-arm only while the generation holds) are the runtime's.
+// ---------------------------------------------------------------------------
 
-    // The replacement trampoline ends in `br x16`, where x16 is the continuation the hook
-    // library hands back through this out-parameter. A null continuation is an unconditional
-    // jump to address 0, so a slot must never be left armed without one. Re-arming an address
-    // the library still owns can fail *after* it has already written the out-parameter, so the
-    // previously validated stub is remembered and restored on failure instead of being lost.
-    void *previous = *slot.original;
-    if (hook_function(reinterpret_cast<void *>(slot.address), slot.replacement,
-            slot.original) != 0) {
-        if (*slot.original == nullptr) *slot.original = previous;
-        return false;
-    }
-    if (*slot.original == nullptr) {
-        // The library reported success but produced no continuation. Put the untouched
-        // prologue back so the Dart function keeps running normally instead of branching to
-        // null, and refuse the slot: a silent follow loss is strictly better than a crash.
-        __android_log_print(ANDROID_LOG_ERROR, kTag,
-            "motion hook refused address=0x%llx continuation missing; prologue restored",
-            static_cast<unsigned long long>(slot.address));
-        dock_motion_guard_events.fetch_add(1, std::memory_order_relaxed);
-        write_code_words(slot.address, before);
-        *slot.original = previous;
-        return false;
-    }
-    slot.registered = true;
-    PatchWords after{};
-    if (stable_read(slot, after) && after != slot.original_words) {
-        slot.patch_words = after;
-        slot.patch_known = true;
-    }
-    return true;
+nhk::InlineHookHost<kPatchBytes / sizeof(uint32_t)> &slot_host() {
+    static nhk::InlineHookHost<kPatchBytes / sizeof(uint32_t)> host = [] {
+        nhk::InlineHookHost<kPatchBytes / sizeof(uint32_t)> value;
+        value.read_slot = [](const HookSlot &slot, PatchWords &words) {
+            return stable_read(slot.address, slot.source, words);
+        };
+        value.write_words = [](uintptr_t address, const PatchWords &words) {
+            return write_code_words(address, words);
+        };
+        value.hook_install = [](void *target, void *replacement, void **original) {
+            const auto &api = nhk::LsposedInlineBackend::instance().entries();
+            if (api.hook_func != nullptr) return api.hook_func(target, replacement, original);
+            return hook_function != nullptr ? hook_function(target, replacement, original) : -1;
+        };
+        value.hook_uninstall = [](void *target) {
+            const auto &api = nhk::LsposedInlineBackend::instance().entries();
+            if (api.unhook_func != nullptr) return api.unhook_func(target);
+            return unhook_function != nullptr ? unhook_function(target) : -1;
+        };
+        value.protect_range = [](uintptr_t address, size_t bytes) {
+            return protect_patch_range(address, bytes);
+        };
+        value.on_guard = [](const nhk::HookEvent &event) {
+            dock_motion_guard_events.fetch_add(1, std::memory_order_relaxed);
+            __android_log_print(ANDROID_LOG_ERROR, kTag, "%s", event.reason);
+        };
+        value.on_info = [](const nhk::HookEvent &event) {
+            __android_log_print(ANDROID_LOG_INFO, kTag, "%s", event.reason);
+        };
+        return value;
+    }();
+    return host;
 }
 
-/**
- * Re-write the exact patch words the hook library installed, without involving it.
- *
- * This module never unhooks a bank and the library keeps both its record and its
- * trampoline for the life of the process, so restoring the recorded bytes at the target
- * address is equivalent to the original installation. It is the fallback for the case
- * that matters most: the file-backed prologue came back and the library refuses to re-arm
- * an address it still believes it owns. Without it the channel stays dead until restart.
- */
-bool restore_patch_words(HookSlot &slot) {
-    if (!slot.patch_known) return false;
-    // Re-arming is only ever safe while the continuation the trampoline branches to exists.
-    // The library normally keeps its stub for process life, but a re-hook attempt can clear
-    // the out-parameter; writing the patch back then would turn every later call into a jump
-    // to address 0. Leaving the prologue untouched keeps the Dart function runnable.
-    if (slot.original == nullptr || *slot.original == nullptr) {
-        __android_log_print(ANDROID_LOG_ERROR, kTag,
-            "motion hook re-arm skipped address=0x%llx continuation missing",
-            static_cast<unsigned long long>(slot.address));
-        dock_motion_guard_events.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-    if (!write_code_words(slot.address, slot.patch_words)) return false;
-    // The live words are the recorded patch again, so the bank verifies clean from here on.
-    slot.registered = true;
-    return true;
-}
-
-/**
- * Install any slot that is not registered yet, and re-arm a registered slot whose live
- * words have returned to the untouched original.
- *
- * The OS4 launcher AOT image is mapped straight out of base.apk (extractNativeLibs=false),
- * so its code pages are file backed and can be re-read underneath a live inline hook, which
- * silently restores the original prologue. The bank then still looks "installed" while
- * nothing fires: no enters, no publishes, no Binder sample, and real-time following stays
- * dead until the desktop restarts. Re-issuing the hook here costs three reads per health
- * tick and restores the channel in place.
- *
- * A slot whose words are neither ours nor the original is a foreign edit; leave it alone.
- */
-bool ensure_slots_live(HookBank &bank) {
-    // Scene hooks must be available before the scale hook can wake subscribers.
-    constexpr std::array<size_t, kTargetCount> order{1, 2, 0};
-    for (const size_t index : order) {
-        auto &slot = bank.slots[index];
-        if (slot.registered) {
-            // A live patch whose continuation vanished would branch to address 0 on the next
-            // call. Disarm it (restore the untouched prologue) before anything else: a channel
-            // that stays down is recoverable, a null branch is not.
-            if (slot.original == nullptr || *slot.original == nullptr) {
-                if (write_code_words(slot.address, slot.original_words)) {
-                    __android_log_print(ANDROID_LOG_ERROR, kTag,
-                        "motion hook disarmed bank=%zu slot=%zu; continuation missing",
-                        bank.index, index);
-                }
-                dock_motion_guard_events.fetch_add(1, std::memory_order_relaxed);
-                slot.registered = false;
-                slot.patch_known = false;
-                return false;
-            }
-            PatchWords observed{};
-            if (!stable_read(slot, observed)) return false;
-            if (slot.patch_known && observed == slot.patch_words) continue;
-            if (observed == slot.original_words) {
-                __android_log_print(ANDROID_LOG_WARN, kTag,
-                    "motion hook patch lost bank=%zu slot=%zu; re-arming",
-                    bank.index, index);
-                slot.registered = false;
-            } else if (!slot.patch_known) {
-                // A hook that landed after the bank was reported partial: adopt the live
-                // words instead of writing the bank off for the rest of the process life.
-                slot.patch_words = observed;
-                slot.patch_known = true;
-                continue;
-            } else {
-                return false;
-            }
-        }
-        if (!install_slot(slot) && !restore_patch_words(slot)) {
-            __android_log_print(ANDROID_LOG_WARN, kTag,
-                "motion hook re-arm failed bank=%zu slot=%zu; channel stays down",
-                bank.index, index);
-            return false;
-        }
-    }
-    return true;
-}
+constexpr std::array<size_t, kTargetCount> kInstallOrder{1, 2, 0};
 
 constexpr uint64_t kPipelineReportNs = 10000000000ULL;
 
@@ -869,23 +800,15 @@ void report_pipeline(bool healthy) {
 }
 
 bool bank_healthy(HookBank &bank) {
-    std::array<PatchWords, kTargetCount> observed{};
-    if (!stable_read(addresses(bank), sources(bank), observed)) return false;
-    for (size_t i = 0; i < bank.slots.size(); ++i) {
-        auto &slot = bank.slots[i];
-        if (!slot.registered) return false;
-        // The replacement tail-branches through this pointer; a missing continuation is a jump
-        // to address 0, so the bank is not healthy until ensure_slots_live() repairs or disarms it.
-        if (slot.original == nullptr || *slot.original == nullptr) return false;
-        if (!slot.patch_known) {
-            if (observed[i] == slot.original_words) return false;
-            slot.patch_words = observed[i];
-            slot.patch_known = true;
-        } else if (observed[i] != slot.patch_words) {
-            return false;
-        }
-    }
-    return true;
+    // Delegates to the shared runtime; the batched stable read keeps the healthy
+    // steady state at one inventory round trip instead of one per slot.
+    return nhk::slots_healthy<kTargetCount, kPatchBytes / sizeof(uint32_t)>(
+        bank.slots,
+        [](const std::array<uintptr_t, kTargetCount> &locations,
+            const TargetSources &expected,
+            std::array<PatchWords, kTargetCount> &observed) {
+            return stable_read(locations, expected, observed);
+        });
 }
 
 /**
@@ -929,7 +852,8 @@ bool add_instance(const ResolvedInstance &instance) {
     if (recycled) hook_banks[index] = std::move(replacement);
     else hook_banks.push_back(std::move(replacement));
     auto &bank = hook_banks[index];
-    const bool installed = ensure_slots_live(bank) && bank_healthy(bank);
+    const bool installed = ensure_slots_live(bank.slots, slot_host(), kInstallOrder)
+        && bank_healthy(bank);
     __android_log_print(installed ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, kTag,
         "motion runtime bank=%zu recycled=%d paramsCID=%u doubleCID=%u install=%s",
         index, recycled ? 1 : 0, instance.resolution.layout.params_class_id,
@@ -952,6 +876,11 @@ bool maintain_dock_motion_hooks_impl(bool force) {
         scan_cooldown = 0;
     }
 
+    // Page-lifetime policy first: the guard must already be installed before a
+    // patch range is registered, otherwise a discard can land in the window
+    // between registration and guard installation.
+    maybe_install_madvise_guard();
+
     bool healthy = false;
     for (auto &bank : hook_banks) {
         const auto state = dock_motion::mapping_state(*inventory, addresses(bank),
@@ -961,7 +890,7 @@ bool maintain_dock_motion_hooks_impl(bool force) {
         // repair probe (a per-slot stable read) runs only after that verification fails,
         // so a lost patch is healed without taxing the healthy steady state.
         if (bank_healthy(bank)) healthy = true;
-        else if (ensure_slots_live(bank) && bank_healthy(bank)) healthy = true;
+        else if (ensure_slots_live(bank.slots, slot_host(), kInstallOrder) && bank_healthy(bank)) healthy = true;
     }
 
     bool scan = force || inventory_changed || !healthy;
@@ -1009,6 +938,619 @@ bool maintain_dock_motion_hooks_impl(bool force) {
     if (healthy) activate_dock_motion();
     else deactivate_dock_motion();
     return healthy;
+}
+
+// ---------------------------------------------------------------------------
+// Optional page-lifetime policy (nativehook/page_guard.h + got_hook_backend.h).
+//
+// The HyperOS Flutter runtime discards its own code pages with MADV_DONTNEED,
+// and a discard that lands on one of our trampoline pages or GOT slots takes
+// the hook with it. Hooking that one library's `madvise` import and splitting
+// discard requests around registered pages closes the race. This decision
+// belongs to the desktop feature - the runtime itself stays policy-free - and
+// a failed install only costs the extra protection, never the channel.
+// ---------------------------------------------------------------------------
+
+// Guard state machine:
+//   0 = pending      - not installed yet, retry on later passes
+//   1 = installed    - replacement is live and its forward target is published
+//   2 = unavailable  - gave up (budget/parse/import), no slot was left behind
+//   3 = installing   - one pass is working on it
+//   4 = residual     - a slot may still hold the replacement; the forward target
+//                      is kept published and no further install is attempted
+std::atomic<uint32_t> madvise_guard_state{0};
+std::atomic<uint32_t> madvise_guard_attempts{0};
+// Published before the GOT slot can reach the replacement; the hook reads it
+// with acquire semantics. Never cleared while a replacement may still be
+// reachable - clearing it would turn the runtime's own madvise into a failure.
+std::atomic<void *> g_real_madvise{nullptr};
+// Install record, so the guard can be re-verified against the live slots
+// instead of being assumed healthy for process life.
+std::vector<nhk::GotHook<>> g_madvise_hooks;
+
+// Explicit budget: a snapshot larger than this is refused outright rather than
+// silently truncated. An image whose tables sit above the first few megabytes
+// (a real system runtime has PT_DYNAMIC at vaddr 0x1101638) needs the whole
+// range, so a "prefix" constant cannot work.
+constexpr uint64_t kGuardImageBudgetBytes = 64ULL * 1024ULL * 1024ULL;
+// Large enough for the ELF header plus any legal program header table
+// (kMaxProgramHeaders * 56 + 64 = 7232). A fixed 4 KiB window would refuse a
+// well-formed image with more than 72 headers.
+constexpr size_t kGuardHeaderBytes = 16 * 1024;
+
+int hyperceiler_guarded_madvise(void *address, size_t length, int advice) {
+    const auto real = reinterpret_cast<int (*)(void *, size_t, int)>(
+        g_real_madvise.load(std::memory_order_acquire));
+    if (real == nullptr) {
+        // The replacement must never be reachable without its forward target;
+        // report an error rather than acting as an unguarded pass-through.
+        return -1;
+    }
+    return nhk::guarded_madvise(address, length, advice, real);
+}
+
+bool flutter_runtime_path(std::string_view path) {
+    constexpr std::string_view kFlutterRuntimeLibrary = "libhyper_os_flutter.so";
+    path = dock_motion::strip_deleted(path);
+    return path == kFlutterRuntimeLibrary || path.ends_with("/libhyper_os_flutter.so");
+}
+
+/**
+ * Which file the runtime image is mapped from, plus - when it is a stored entry
+ * of a container - the page window that entry occupies inside it.
+ *
+ * `extractNativeLibs=false` is why the window exists: the kernel maps the
+ * library straight out of the APK and reports the *container* path for every
+ * library it backs, so `base.apk` is shared by the whole `lib/<abi>/` directory
+ * and a path alone can no longer identify an image. A bare file keeps the
+ * trivial window [0, UINT64_MAX) and its offsets already are image offsets.
+ */
+struct RuntimeImageTarget {
+    std::string path;
+    uint64_t view_begin = 0;
+    uint64_t view_end = UINT64_MAX;
+};
+
+struct RuntimeContainerProbe {
+    std::string path;
+    uint64_t inode = 0;
+    std::optional<std::pair<uint64_t, uint64_t>> entry;
+};
+
+constexpr size_t kRuntimeContainerProbeLimit = 8;
+// Only ever touched with `hook_mutex` held: the guard install and maintenance
+// passes are both driven from the single maintenance worker. Probing an APK
+// reads its tail and central directory, so the answer is cached for the process
+// lifetime instead of once per pass.
+std::vector<RuntimeContainerProbe> runtime_container_probes;
+
+/** Stored `libhyper_os_flutter.so` entry of a container, probed at most once. */
+std::optional<std::pair<uint64_t, uint64_t>> runtime_container_entry(
+    const std::string &path, uint64_t inode) {
+    for (const auto &probe : runtime_container_probes) {
+        if (probe.path == path && probe.inode == inode) return probe.entry;
+    }
+    if (runtime_container_probes.size() >= kRuntimeContainerProbeLimit) return std::nullopt;
+    RuntimeContainerProbe probe;
+    probe.path = path;
+    probe.inode = inode;
+    probe.entry = nhk::zip_stored_entry(path, "libhyper_os_flutter.so");
+    const auto entry = probe.entry;
+    runtime_container_probes.push_back(std::move(probe));
+    return entry;
+}
+
+/**
+ * Find the runtime image in one inventory.
+ *
+ * Layer 1 is the library mapped under its own name, which is also everything a
+ * firmware with `extractNativeLibs=true` produces. Layer 2 is the container
+ * mapping described by [RuntimeImageTarget]; it is tried second because a
+ * transient preload copy of the same library can be mapped at the same time,
+ * and the file that carries the library's own name is the better answer when
+ * both exist. Returns nothing when neither is present.
+ *
+ * Measured on device (Android 17, `extractNativeLibs=false`): on a cold launcher
+ * start the vendor's preload copy of `/system_ext/lib64/libhyper_os_flutter.so`
+ * was mapped for a few milliseconds only - one pass saw its four segments, the
+ * scan seven milliseconds later did not, and the engine's own mappings showed up
+ * about four seconds in, backed by stored `base.apk` entries (window 0x710000).
+ * Layer 1 alone would have installed nothing on that start; Layer 2 is what
+ * makes the guard reachable at all. Layer 1 still leads, because when the copy
+ * does persist it is a real engine image - and a record bound to a copy that
+ * disappears afterwards is repaired by the generation check, which is exactly
+ * what it exists for.
+ */
+std::optional<RuntimeImageTarget> identify_runtime_image(
+    const std::vector<nhk::FileMapping> &all) {
+    for (const auto &mapping : all) {
+        if (!flutter_runtime_path(mapping.path)) continue;
+        return RuntimeImageTarget{
+            std::string(nhk::strip_deleted(mapping.path)), 0, UINT64_MAX};
+    }
+    for (const auto &mapping : all) {
+        if (mapping.writable || mapping.path.empty() || mapping.path.front() != '/') continue;
+        const std::string_view path = nhk::strip_deleted(mapping.path);
+        if (!path.ends_with(".apk")) continue;
+        const auto entry = runtime_container_entry(std::string(path), mapping.inode);
+        if (!entry) continue;
+        const uint64_t begin = page_down(entry->first);
+        const uint64_t end = page_up(entry->first + entry->second);
+        if (mapping.file_offset < begin || mapping.file_offset >= end) continue;
+        return RuntimeImageTarget{std::string(path), begin, end};
+    }
+    return std::nullopt;
+}
+
+/**
+ * One target image's own mapping inventory, or nothing when it could not be
+ * determined at all.
+ *
+ * Offsets are rebased on the view start, so `begin - file_offset` is the load
+ * bias for every mapping - the identity the GOT records are verified against
+ * (`begin - file_offset == load_base`). An unrebased container offset would make
+ * that comparison fail for every mapping but the first.
+ *
+ * The two failure modes must stay distinguishable, because the maintenance pass
+ * draws opposite conclusions from them:
+ *
+ * - an **empty** list means the image genuinely has no mapping right now, so
+ *   the recorded generation is gone and the record may be dropped;
+ * - **nothing** means "unknown" - `/proc/self/maps` was unreadable or the scan
+ *   hit its budget. Treating that as an unload would discard a record whose GOT
+ *   slots may still hold the replacement, and the next install would then
+ *   refuse the symbol (expected == replacement) with the healthy record already
+ *   lost. Unrecoverable by construction, so it must never happen.
+ */
+std::optional<std::vector<nhk::ExecutableMapping>> runtime_mappings(
+    const std::vector<nhk::FileMapping> &mappings,
+    const RuntimeImageTarget &target) {
+    std::vector<nhk::ExecutableMapping> result;
+    for (const auto &mapping : mappings) {
+        if (nhk::strip_deleted(mapping.path) != target.path) continue;
+        if (mapping.file_offset < target.view_begin
+            || mapping.file_offset >= target.view_end) continue;
+        if (result.size() >= nhk::kMaxExecutableMappings) return {};
+        result.push_back({mapping.begin, mapping.end,
+            mapping.file_offset - target.view_begin, mapping.device_major,
+            mapping.device_minor, mapping.inode});
+    }
+    std::ranges::sort(result, {}, &nhk::ExecutableMapping::begin);
+    return result;
+}
+
+// The image the recorded GOT slots belong to, captured at install time. Kept so
+// the maintenance pass verifies the record against the *same* identity it was
+// created from - re-identifying would follow the rules to a different answer if
+// a preload copy of the library appeared meanwhile. Cleared together with the
+// hook record; never cleared while a record still exists.
+std::optional<RuntimeImageTarget> g_madvise_target;
+
+/**
+ * Drop the guarded-slot record together with the generation it belongs to.
+ *
+ * The two are one fact split in half: a record whose identity is gone can no
+ * longer validate its slots, and an identity with no record has nothing left to
+ * validate. Releasing them apart is exactly how a stale record survives a remap
+ * and then "proves" stability against the wrong image.
+ */
+void release_madvise_record() {
+    g_madvise_hooks.clear();
+    g_madvise_target.reset();
+}
+
+bool read_pointer_safely(uintptr_t slot, const void *&value) {
+    return safe_read(slot,
+        std::span<std::byte>(reinterpret_cast<std::byte *>(&value), sizeof(value)));
+}
+
+/**
+ * Register the pages a patch range will touch with the page-lifetime policy.
+ * Both the first and the last byte can fall on different pages; every page in
+ * between must be registered, and a full table refuses the range.
+ */
+bool protect_patch_range(uintptr_t address, size_t bytes) {
+    if (bytes == 0 || nhk::add_overflows(address, bytes)) return false;
+    const uint64_t page = host_page_size();
+    const uintptr_t first = static_cast<uintptr_t>(page_down(address));
+    const uintptr_t last = static_cast<uintptr_t>(page_down(address + bytes - 1));
+    for (uintptr_t current = first; current <= last; current += page) {
+        if (!nhk::add_protected_page(current)) return false;
+        if (current > UINTPTR_MAX - page) break; // Defensive: no wrap-around loop.
+    }
+    return true;
+}
+
+/**
+ * Re-verify the guard against the live slots, per image generation.
+ *
+ * The distinction that matters: an unreadable slot can mean "someone else took
+ * it" or "this generation is gone". Only the target's own mapping identity can
+ * tell them apart, and only the second case may be followed by a fresh install
+ * on the new generation. Log lines are deduplicated per outcome - a maintenance
+ * pass runs four times a second and must not flood the buffer.
+ */
+void maintain_madvise_guard() {
+    if (g_madvise_hooks.empty()) return;
+    // 0 none, 1 remapped, 2 foreign, 3 rearm, 4 residual cleared,
+    // 5 residual kept, 6 inventory unavailable.
+    static uint32_t logged_outcome = 0;
+    std::ifstream maps("/proc/self/maps");
+    std::optional<std::vector<nhk::ExecutableMapping>> current;
+    if (maps && g_madvise_target) {
+        current = runtime_mappings(nhk::parse_file_mappings(maps), *g_madvise_target);
+    }
+    if (!current) {
+        // "Unknown" is not "gone": an unreadable or over-budget scan proves
+        // nothing about the library. Postpone the pass and keep the record - the
+        // slots may still hold the replacement, and dropping the record would
+        // make that state unrecoverable.
+        if (logged_outcome != 6) {
+            logged_outcome = 6;
+            __android_log_print(ANDROID_LOG_INFO, kTag,
+                "madvise guard inventory unavailable; keeping the record and retrying");
+        }
+        return;
+    }
+    bool healthy = false;
+    bool rearmable = false;
+    bool foreign = false;
+    bool generation_gone = false;
+    bool residual_present = false;
+    for (const auto &hook : g_madvise_hooks) {
+        if (!hook.identity_present(*current)) {
+            generation_gone = true;
+            continue;
+        }
+        if (hook.partial) {
+            residual_present = true;
+            continue;
+        }
+        switch (hook.health([](uintptr_t slot, const void *&value) {
+                    return read_pointer_safely(slot, value);
+                })) {
+            case nhk::GotHook<>::State::healthy: healthy = true; break;
+            case nhk::GotHook<>::State::rearmable: rearmable = true; break;
+            case nhk::GotHook<>::State::foreign: foreign = true; break;
+            case nhk::GotHook<>::State::empty: break;
+        }
+    }
+
+    if (generation_gone) {
+        // The library was remapped or unloaded: the recorded addresses belong to
+        // a generation that no longer exists. Never write them, keep the forward
+        // target published (a call already inside the replacement still returns
+        // through it), and let the next install pass discover the new one.
+        if (logged_outcome != 1) {
+            logged_outcome = 1;
+            __android_log_print(ANDROID_LOG_INFO, kTag,
+                "madvise guard generation changed; rediscovering the runtime image");
+        }
+        release_madvise_record();
+        madvise_guard_state.store(0U, std::memory_order_release);
+        return;
+    }
+    if (residual_present) {
+        // A residue may only be dropped once every recorded slot is back to the
+        // original pointer *and* every page it captured protection for holds the
+        // bits captured before the first write. The pointer test alone is not
+        // enough: the write path stores the value and only then restores the
+        // page, so a page can be left writable while its slot already reads as
+        // the original. Releasing the record there would let the next install
+        // capture RW as "the original" and leave the RELRO page permanently
+        // writable.
+        bool slots_restored = true;
+        bool protections_ok = true;
+        for (const auto &hook : g_madvise_hooks) {
+            if (!hook.partial) continue;
+            for (size_t i = 0; i < hook.slot_count; ++i) {
+                const void *value = nullptr;
+                if (!read_pointer_safely(hook.slots[i], value) || value != hook.expected) {
+                    slots_restored = false;
+                }
+            }
+            if (!nhk::protections_restored(hook)) protections_ok = false;
+        }
+        if (slots_restored && !protections_ok) {
+            // The pointers are home; only the permission is wrong. Re-apply the
+            // captured bits - never re-sample them, since the current ones are
+            // exactly what cannot be trusted.
+            for (const auto &hook : g_madvise_hooks) {
+                if (hook.partial) (void)nhk::reapply_protections(hook);
+            }
+            protections_ok = true;
+            for (const auto &hook : g_madvise_hooks) {
+                if (hook.partial && !nhk::protections_restored(hook)) {
+                    protections_ok = false;
+                }
+            }
+        }
+        if (slots_restored && protections_ok) {
+            if (logged_outcome != 4) {
+                logged_outcome = 4;
+                __android_log_print(ANDROID_LOG_INFO, kTag,
+                    "madvise guard residue cleared; slots and page protections are original");
+            }
+            release_madvise_record();
+            madvise_guard_state.store(0U, std::memory_order_release);
+        } else if (logged_outcome != 5) {
+            // Keep the record: it is the only thing that still knows the true
+            // original protection, so it must survive until it can be applied.
+            logged_outcome = 5;
+            __android_log_print(ANDROID_LOG_WARN, kTag,
+                "madvise guard residue retained; slots_restored=%d protections_restored=%d",
+                slots_restored ? 1 : 0, protections_ok ? 1 : 0);
+        }
+        return;
+    }
+    if (foreign) {
+        // The generation is still mapped but the slot is not ours any more:
+        // leave it alone, keep the forward target, and stop trying.
+        if (logged_outcome != 2) {
+            logged_outcome = 2;
+            __android_log_print(ANDROID_LOG_WARN, kTag,
+                "madvise guard slot taken over by a third party; leaving it alone");
+        }
+        madvise_guard_state.store(4U, std::memory_order_release);
+        return;
+    }
+    if (rearmable && !healthy) {
+        // Every slot is back to the original pointer (page refill, remap):
+        // a fresh install pass is safe again.
+        if (logged_outcome != 3) {
+            logged_outcome = 3;
+            __android_log_print(ANDROID_LOG_INFO, kTag,
+                "madvise guard slots returned to original; re-arming");
+        }
+        release_madvise_record();
+        madvise_guard_state.store(0U, std::memory_order_release);
+    }
+}
+
+/**
+ * Report why the guard is still pending, once per distinct reason.
+ *
+ * The pass runs four times a second, so a log per attempt would flood the
+ * buffer - that is why the retry budget exists. But the budget alone made the
+ * whole subsystem unobservable: "the runtime is not loaded yet" and "the path
+ * never matches the inventory" both leave state 0 behind with no attempt
+ * consumed and no line in the log, and the two call for opposite responses.
+ * Each reason is therefore reported exactly once, keyed separately from the
+ * rendered detail so a changing count (say, the inventory size) cannot turn one
+ * state into a stream of lines.
+ */
+void report_guard_pending(const std::string &key, const std::string &detail) {
+    if (!claim_report("guard|" + key)) return;
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+        "madvise guard pending: %s", detail.c_str());
+}
+
+void maybe_install_madvise_guard() {
+    // The generation check walks /proc/self/maps, which is not free: run it on
+    // every fourth maintenance pass (~1 s) instead of four times a second.
+    static std::atomic<uint32_t> maintain_tick{0};
+    if (maintain_tick.fetch_add(1, std::memory_order_relaxed) % 4U == 0U) {
+        maintain_madvise_guard();
+    }
+    const uint32_t state = madvise_guard_state.load(std::memory_order_acquire);
+    if (state == 1U || state == 2U || state == 4U) return; // Settled (or residual).
+    uint32_t expected = 0;
+    if (!madvise_guard_state.compare_exchange_strong(expected, 3U,
+            std::memory_order_acq_rel)) {
+        return; // Another pass is installing right now.
+    }
+    // Two kinds of "not installed", and the budget only makes sense for one.
+    //
+    // `give_up` is for a *settled* answer: the library is here and the guard
+    // cannot be built from it (its image is over budget, its ELF does not
+    // parse). Retrying those forever would burn a pass every 250 ms for nothing.
+    //
+    // `stay_pending` is for "not yet": the image is mid-load, so its mappings
+    // are still appearing one by one and a snapshot taken now is incomplete. The
+    // APK-backed case made this concrete - the first pass found the stored entry
+    // but the executable segment was not mapped yet, and a budget spent on "not
+    // yet" ends in a permanent give-up seconds before the library is usable.
+    // These cost no attempt; each reason still logs once.
+    const auto give_up = [&](const char *reason) {
+        report_guard_pending(reason, reason);
+        const uint32_t attempt = madvise_guard_attempts.fetch_add(1) + 1;
+        if (attempt >= kMadviseGuardMaxAttempts) {
+            __android_log_print(ANDROID_LOG_WARN, kTag,
+                "madvise guard unavailable after %u attempts: %s (fail-open)",
+                attempt, reason);
+            madvise_guard_state.store(2U, std::memory_order_release);
+        } else {
+            // Settled but failed this time; another pass may still succeed.
+            madvise_guard_state.store(0U, std::memory_order_release);
+        }
+    };
+    const auto stay_pending = [&](const char *reason) {
+        report_guard_pending(reason, reason);
+        madvise_guard_state.store(0U, std::memory_order_release);
+    };
+
+    std::ifstream maps("/proc/self/maps");
+    if (!maps) {
+        give_up("cannot read /proc/self/maps");
+        return;
+    }
+    const auto all = nhk::parse_file_mappings(maps);
+    // Which image do the recorded GOT slots belong to? With
+    // `extractNativeLibs=false` the kernel reports the APK path for the runtime's
+    // mappings, so matching on "libhyper_os_flutter.so" alone only ever finds the
+    // vendor's transient preload copy - which the spawner dlcloses moments later.
+    const auto target = identify_runtime_image(all);
+    if (!target) {
+        // Not loaded yet: stay pending and spend no attempt. The runtime may be
+        // dlopen'd seconds after the launcher starts, and a budget consumed by
+        // "not yet" would end in a permanent give-up before it ever appears.
+        report_guard_pending("runtime-not-mapped",
+            "runtime not mapped across " + std::to_string(all.size())
+                + " file mapping(s)");
+        madvise_guard_state.store(0U, std::memory_order_release);
+        return;
+    }
+    // Stable-snapshot discipline, measured on the *target's own* mappings: the
+    // Dart image's inventory says nothing about this library, so comparing it
+    // would validate the wrong thing entirely. An absent inventory ("unreadable")
+    // and an empty one ("no mapping left") are both unusable here, and the check
+    // below refuses the pass instead of guessing which one it was.
+    const auto flutter_before = runtime_mappings(all, *target);
+    // Stage 1: the ELF header and program header table. They live in the first
+    // mapping of the file, so read that one's head - not "the first executable
+    // mapping", whose first byte is not the header at all.
+    const nhk::FileMapping *header_map = nullptr;
+    for (const auto &mapping : all) {
+        if (nhk::strip_deleted(mapping.path) != target->path) continue;
+        if (mapping.file_offset < target->view_begin
+            || mapping.file_offset >= target->view_end) {
+            continue;
+        }
+        if (header_map == nullptr || mapping.file_offset < header_map->file_offset) {
+            header_map = &mapping;
+        }
+    }
+    if (header_map == nullptr) {
+        report_guard_pending("runtime-window-empty",
+            "no mapping inside the runtime window of " + target->path);
+        madvise_guard_state.store(0U, std::memory_order_release);
+        return;
+    }
+    if (header_map->end - header_map->begin < kGuardHeaderBytes) {
+        give_up("runtime header mapping shorter than a page");
+        return;
+    }
+    std::array<std::byte, kGuardHeaderBytes> head{};
+    if (!safe_read(header_map->begin, std::span<std::byte>(head))) {
+        stay_pending("runtime header unreadable this pass");
+        return;
+    }
+    const auto segments = nhk::elf::parse_program_segments(std::span<const std::byte>(head));
+    if (!segments) {
+        stay_pending("runtime program headers rejected");
+        return;
+    }
+    // The window matters: an APK carries several libraries, so the target's
+    // mappings can only be told apart from its neighbours by the byte range its
+    // stored entry occupies.
+    const auto view = nhk::image_view_from_segments_in_window(
+        all, target->path, *segments, target->view_begin, target->view_end);
+    if (!view) {
+        stay_pending("runtime mappings do not match its program headers");
+        return;
+    }
+    if (view->needed_vaddr == 0 || view->needed_vaddr > kGuardImageBudgetBytes) {
+        __android_log_print(ANDROID_LOG_WARN, kTag,
+            "madvise guard unavailable: image needs %llu bytes, budget is %llu",
+            static_cast<unsigned long long>(view->needed_vaddr),
+            static_cast<unsigned long long>(kGuardImageBudgetBytes));
+        give_up("image exceeds the snapshot budget");
+        return;
+    }
+
+    // Stage 2: snapshot the image's virtual address range, laid out by address
+    // so the parser can index it by vaddr; gaps stay zero. Every range must
+    // read completely - a half-read snapshot must not be parsed as if it were
+    // the image.
+    static std::vector<std::byte> snapshot;
+    const size_t needed = static_cast<size_t>(view->needed_vaddr);
+    if (snapshot.size() < needed) snapshot.resize(needed);
+    std::fill(snapshot.begin(), snapshot.begin() + static_cast<ptrdiff_t>(needed),
+        std::byte{0});
+    for (const auto &range : view->ranges) {
+        if (range.vaddr >= needed) continue;
+        const uint64_t usable = std::min<uint64_t>(range.bytes, needed - range.vaddr);
+        if (usable == 0) continue;
+        if (!safe_read(range.begin,
+                std::span<std::byte>(snapshot.data() + range.vaddr,
+                    static_cast<size_t>(usable)))) {
+            stay_pending("runtime segment unreadable this pass");
+            return;
+        }
+    }
+    const auto image = nhk::elf::ElfImage::make_with_segments(
+        static_cast<uintptr_t>(view->load_base),
+        std::span<const std::byte>(snapshot.data(), needed), *segments);
+    if (!image) {
+        give_up("runtime ELF rejected");
+        return;
+    }
+    std::optional<std::vector<nhk::ExecutableMapping>> flutter_after;
+    {
+        std::ifstream fresh("/proc/self/maps");
+        if (fresh) flutter_after = runtime_mappings(nhk::parse_file_mappings(fresh), *target);
+    }
+    if (!flutter_before || flutter_before->empty() || !flutter_after
+        || flutter_after->empty()) {
+        // "Unknown" is not "unchanged": the second scan could not be taken, so
+        // stability cannot be proven either way. Refuse this pass instead of
+        // installing against a snapshot whose counterpart is missing - a later
+        // pass re-reads both sides and settles.
+        stay_pending("runtime inventory unavailable during the snapshot");
+        return;
+    }
+    if (*flutter_before != *flutter_after) {
+        // The library was remapped while being read: the headers and the bytes
+        // may come from different generations.
+        stay_pending("runtime mappings changed during the snapshot");
+        return;
+    }
+    nhk::ImageIdentity identity;
+    identity.device_major = header_map->device_major;
+    identity.device_minor = header_map->device_minor;
+    identity.inode = header_map->inode;
+    identity.load_base = view->load_base;
+
+    std::vector<nhk::GotHook<>> installed;
+    std::vector<nhk::GotHook<>> residual;
+    bool rollback_clean = true;
+    const bool installed_ok = nhk::install_madvise_guard(*image,
+        [](uintptr_t slot, const void *&value) {
+            return read_pointer_safely(slot, value);
+        },
+        reinterpret_cast<void *>(hyperceiler_guarded_madvise),
+        // Published before the slot is replaced: once the GOT points at the
+        // replacement, its forwarding target is already visible.
+        [](void *original) {
+            g_real_madvise.store(original, std::memory_order_release);
+        },
+        installed, &rollback_clean, identity, &residual);
+    if (!installed_ok) {
+        if (!rollback_clean && !residual.empty()) {
+            // Slots may still hold the replacement. Keep the record (so the
+            // state stays visible and repairable) and keep the forward target:
+            // a clean rollback does NOT prove nothing is executing the
+            // replacement - a thread may already have loaded its address or be
+            // inside it, still to read the forward target. Clearing it would
+            // turn that call into a failure.
+            __android_log_print(ANDROID_LOG_ERROR, kTag,
+                "madvise guard rollback incomplete; %zu slot record(s) kept and "
+                "forward target retained", residual.size());
+            g_madvise_hooks = std::move(residual);
+            // Kept as evidence *and* as the identity later passes validate
+            // against - a residue without its generation cannot be repaired.
+            g_madvise_target = *target;
+            madvise_guard_state.store(4U, std::memory_order_release);
+            return;
+        }
+        // Nothing was left behind; the forward target is either untouched (never
+        // published) or, if it was published, left as it is for the same
+        // in-flight reason.
+        give_up("madvise import missing or ambiguous");
+        return;
+    }
+    g_madvise_hooks = std::move(installed);
+    // Bind the record to the exact image generation it was read from: every
+    // later maintenance pass validates the slots against this identity.
+    g_madvise_target = *target;
+    // Naming the source is what tells the two identification layers apart in the
+    // field: window=0 is a bare, file-named copy, any other window is a stored
+    // entry inside a container. Without it the line only says "it worked".
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+        "madvise guard installed; %zu slot(s) protected from %s window=0x%llx",
+        g_madvise_hooks.size(), target->path.c_str(),
+        static_cast<unsigned long long>(target->view_begin));
+    madvise_guard_state.store(1U, std::memory_order_release);
 }
 
 bool maintain_dock_motion_hooks(bool force) noexcept {
@@ -1093,9 +1635,13 @@ uint32_t dock_native_motion_state() {
     return state;
 }
 
-void start_dock_native_motion(Hook hook, Unhook) {
+void start_dock_native_motion(Hook hook, Unhook unhook) {
     if (hook == nullptr || started.exchange(true)) return;
     hook_function = hook;
+    unhook_function = unhook;
+    // Register with the shared backend boundary so the slot host installs
+    // through the same entry points the runtime documents.
+    nhk::LsposedInlineBackend::instance().install_entries({hook, unhook});
     pthread_t thread;
     if (pthread_create(&thread, nullptr, motion_worker, nullptr) == 0) pthread_detach(thread);
     else {

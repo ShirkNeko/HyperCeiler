@@ -26,7 +26,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
-import android.os.RemoteException
 import android.os.SystemClock
 import android.util.Log
 import android.view.SurfaceControl
@@ -35,29 +34,39 @@ import com.sevtinge.hyperceiler.common.log.XposedLog
 import io.github.lingqiqi5211.ezhooktool.core.callMethod
 import java.util.UUID
 
-/** No provider IPC, waiting or HWUI work on the WMS thread/under the global WM lock. */
+/**
+ * No provider IPC, waiting or HWUI work on the WMS thread/under the global WM lock.
+ *
+ * <p>This class runs inside system_server, so an exception that leaves any posted task or
+ * framework callback reaches the process uncaught handler and becomes
+ * "FATAL EXCEPTION IN SYSTEM PROCESS". Every asynchronous entry point therefore goes through
+ * [guard], and recoverable failures are turned into a bounded retry instead of an escape.
+ */
 internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, private val changed: () -> Unit) {
     class Ticket(val key: String, val context: Context,
         val bounds: DockWindowPolicy.Bounds, val dark: Boolean) {
         val id: String = UUID.randomUUID().toString()
+
+        /**
+         * Generation counter, single-flight recovery latch, retry budget, readiness and
+         * refresh epochs. All bookkeeping lives here so the transitions are unit-testable
+         * without an Android runtime.
+         */
+        val gate = DockGlassRecoveryGate()
+
         @Volatile var lease: DockGlassSurfaceLease? = null
         @Volatile var ready = false
         @Volatile var dead = false
-        @Volatile var cancelled = false
+
+        /** Retired by [DockGlassClient.release]; also permanently blocks later retries. */
+        val cancelled: Boolean get() = gate.isCancelled()
+
         // Only touched by the serial IPC worker.
         var parcel: SurfaceControlViewHost.SurfacePackage? = null
         var lifetime: IBinder? = null
         var death: IBinder.DeathRecipient? = null
-        var attempts = 0
-        var previouslyReady = false
-        var consecutiveFailures = 0
-        var recoveryPending = false
         var client: ContentProviderClient? = null
         var refreshes = 0
-        var readinessEpoch = 0
-        @Volatile var lastRefreshRequest = 0L
-        @Volatile var refreshRequestEpoch = 0
-        @Volatile var refreshAllowed = true
 
         fun request(method: String, args: Bundle? = null): Bundle {
             // Keep an UNSTABLE reference for the lifetime of the active windowless host,
@@ -114,7 +123,7 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
         private fun flushDiagnostics() {
             val context = diagnosticContext ?: return
             if (events.isEmpty()) return
-            runCatching {
+            catchingRecoverable({
                 val client = context.contentResolver.acquireUnstableContentProviderClient(uri)
                     ?: return
                 client.use {
@@ -123,7 +132,7 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
                     }) ?: error("No journal response")
                 }
                 events.clear()
-            }
+            })
             // If boot-time provider acquisition fails, retain the bounded queue for the next event.
         }
 
@@ -136,22 +145,49 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
     fun bindDiagnostics(context: Context) { if (!closed) journal.bind(context) }
     fun record(event: String) { if (!closed) journal.record(event) }
 
+    /**
+     * Run one asynchronous DockGlass task behind a hard exception boundary.
+     *
+     * <p>Only [Exception] is caught: `OutOfMemoryError`, `StackOverflowError` and `ThreadDeath`
+     * keep their normal, fatal behaviour rather than being silently swallowed. The boundary
+     * exists so a defect in DockGlass degrades glass instead of killing system_server.
+     */
+    private fun guard(task: String, body: () -> Unit) {
+        try {
+            body()
+        } catch (error: Exception) {
+            val reason = "${error.javaClass.simpleName}: ${error.message?.take(160)}"
+            try {
+                record("glass task failed task=$task reason=$reason")
+            } catch (ignored: Exception) {
+                // The diagnostic path must never mask the original failure.
+            }
+            try {
+                XposedLog.w("DockGlass", "system", "DockGlass $task failed: $reason")
+            } catch (ignored: Exception) {
+            }
+        }
+    }
+
     fun create(context: Context, key: String, bounds: DockWindowPolicy.Bounds, dark: Boolean): Ticket {
         val ticket = Ticket(key, context, bounds, dark)
         bindDiagnostics(context)
-        worker.post { attemptCreate(ticket) }
+        worker.post { guard("create") { attemptCreate(ticket) } }
         return ticket
     }
 
     private fun attemptCreate(ticket: Ticket) {
-        if (ticket.cancelled || closed) return
-        ticket.recoveryPending = false
-        ticket.attempts++
+        if (!ticket.gate.beginAttempt(closed)) return
         ticket.dead = false
-        record("glass create id=${ticket.id} attempt=${ticket.attempts}")
+        record("glass create id=${ticket.id} attempt=${ticket.gate.getAttempts()}")
         try {
             check(dispose(ticket)) { "Previous glass surface could not be detached" }
-            processGuard.acquire(ticket.context, ticket)
+            if (!processGuard.acquire(ticket.context, ticket)) {
+                // The package is mid-replacement: nothing is broken and nothing may be
+                // disposed. Park the generation and retry on the dependency cadence.
+                deferForDependency(ticket)
+                return
+            }
             val bounds = ticket.bounds
             val args = Bundle().apply {
                 putInt("width", bounds.width()); putInt("height", bounds.height())
@@ -165,11 +201,20 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
                 ?: error(response.getString("error") ?: "Renderer returned no surface")
             ticket.lifetime = response.getBinder("lifetime") ?: error("Renderer returned no lifetime token")
             if (ticket.cancelled || closed) { dispose(ticket); return }
-            val generation = ticket.attempts
-            val readinessEpoch = ++ticket.readinessEpoch
+            val generation = ticket.gate.getAttempts()
+            val readinessEpoch = ticket.gate.openReadinessEpoch()
             val death = IBinder.DeathRecipient {
                 worker.post {
-                    if (generation == ticket.attempts) recover(ticket, "renderer died")
+                    guard("renderer death") {
+                        if (!ticket.gate.isAttemptCurrent(generation)) {
+                            if (ticket.gate.noteStaleCallback()) {
+                                record("glass stale death callback id=${ticket.id} " +
+                                    "generation=$generation current=${ticket.gate.getAttempts()}")
+                            }
+                            return@guard
+                        }
+                        recover(ticket, "renderer died")
+                    }
                 }
             }
             ticket.death = death
@@ -202,36 +247,42 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
             changed()
             // Parent first, then wait for the vendor background texture, not just a drawn buffer.
             checkBackground(ticket, 0, generation, readinessEpoch)
-        } catch (error: IllegalStateException) {
-            recover(ticket, "create ${error.javaClass.simpleName}: ${error.message?.take(160)}")
-        } catch (error: RemoteException) {
-            recover(ticket, "create ${error.javaClass.simpleName}: ${error.message?.take(160)}")
-        } catch (error: SecurityException) {
+        } catch (error: Exception) {
+            // Covers the framework exception types this path used to catch individually
+            // (IllegalStateException, RemoteException, SecurityException) plus any reflection
+            // failure from the guard/framework calls. VM fatals are intentionally not caught.
             recover(ticket, "create ${error.javaClass.simpleName}: ${error.message?.take(160)}")
         }
     }
 
     private fun checkBackground(ticket: Ticket, attempt: Int, generation: Int, readinessEpoch: Int) {
-        worker.postDelayed(fun() {
-            if (ticket.cancelled || ticket.dead || closed) return
-            if (generation != ticket.attempts || readinessEpoch != ticket.readinessEpoch) return
-            try {
-                val status = ticket.request("dock_glass_status")
-                status.getString("error")?.let { error(it) }
-                val wasReady = ticket.ready
-                ticket.ready = ticket.lease?.isAttached == true && status.getBoolean("backgroundReady")
-                if (wasReady != ticket.ready) changed()
-                if (ticket.ready) {
-                    ticket.previouslyReady = true
-                    ticket.consecutiveFailures = 0
-                    record("glass ready id=${ticket.id} attempt=${ticket.attempts} check=${attempt + 1}")
-                } else if (attempt + 1 < DockGlassRetryPolicy.BACKGROUND_CHECKS) {
-                    checkBackground(ticket, attempt + 1, generation, readinessEpoch)
-                } else {
-                    recover(ticket, "background texture timeout after ${attempt + 1} checks")
+        worker.postDelayed({
+            guard("readiness") {
+                if (ticket.cancelled || ticket.dead || closed) return@guard
+                if (!ticket.gate.isReadinessCurrent(generation, readinessEpoch)) {
+                    if (ticket.gate.noteStaleCallback()) {
+                        record("glass stale readiness id=${ticket.id} generation=$generation " +
+                            "current=${ticket.gate.getAttempts()}")
+                    }
+                    return@guard
                 }
-            } catch (error: Exception) {
-                recover(ticket, "status ${error.javaClass.simpleName}: ${error.message?.take(160)}")
+                try {
+                    val status = ticket.request("dock_glass_status")
+                    status.getString("error")?.let { error(it) }
+                    val wasReady = ticket.ready
+                    ticket.ready = ticket.lease?.isAttached == true && status.getBoolean("backgroundReady")
+                    if (wasReady != ticket.ready) changed()
+                    if (ticket.ready) {
+                        ticket.gate.markReady()
+                        record("glass ready id=${ticket.id} attempt=${ticket.gate.getAttempts()} check=${attempt + 1}")
+                    } else if (attempt + 1 < DockGlassRetryPolicy.BACKGROUND_CHECKS) {
+                        checkBackground(ticket, attempt + 1, generation, readinessEpoch)
+                    } else {
+                        recover(ticket, "background texture timeout after ${attempt + 1} checks")
+                    }
+                } catch (error: Exception) {
+                    recover(ticket, "status ${error.javaClass.simpleName}: ${error.message?.take(160)}")
+                }
             }
         }, 500)
     }
@@ -241,126 +292,179 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
         // Never queue remote reparent operations in WMS's deferred sync transaction:
         // it could commit AFTER worker cleanup and resurrect a retired surface.
         worker.post {
-            val shouldSkip = closed || ticket.cancelled || ticket.dead || ticket.lease !== lease
-            if (shouldSkip) return@post
-            runCatching { lease.attach(parent) }.onFailure {
-                recover(ticket, "surface attachment failed: ${it.javaClass.simpleName}")
+            guard("attach") {
+                val stale = closed || ticket.cancelled || ticket.dead || ticket.lease !== lease
+                if (stale) {
+                    if (ticket.gate.noteStaleCallback()) {
+                        record("glass stale attach ignored id=${ticket.id} closed=$closed " +
+                            "cancelled=${ticket.cancelled} dead=${ticket.dead}")
+                    }
+                    return@guard
+                }
+                catchingRecoverable({ lease.attach(parent) }) {
+                    recover(ticket, "surface attachment failed: ${it.javaClass.simpleName}")
+                }
             }
         }
     }
 
     /** Verify HyperCeiler's own texture after its parent becomes visible again. */
     fun resume(ticket: Ticket, allowFallback: Boolean = true) {
-        val requestedAt = SystemClock.uptimeMillis()
-        val requestEpoch: Int
-        synchronized(ticket) {
-            ticket.refreshAllowed = true
-            // Visibility and wallpaper-home callbacks can describe the same return.
-            if (requestedAt - ticket.lastRefreshRequest < 250) return
-            ticket.lastRefreshRequest = requestedAt
-            requestEpoch = ++ticket.refreshRequestEpoch
-        }
+        // Visibility and wallpaper-home callbacks can describe the same return.
+        val requestEpoch = ticket.gate.requestRefresh(SystemClock.uptimeMillis())
+        if (requestEpoch == DockGlassRecoveryGate.REFRESH_DEDUPLICATED) return
         // The parent's show is part of WMS's sync transaction. Probe after that
         // transaction commits; a healthy producer is never toggled or recreated.
-        worker.postDelayed(resume@{
-            if (closed || ticket.cancelled || ticket.dead || ticket.lease == null
-                || !ticket.refreshAllowed || requestEpoch != ticket.refreshRequestEpoch) return@resume
-            // Initial creation already owns its readiness loop. A resume probe is
-            // meaningful only after this generation has displayed native glass.
-            if (!ticket.previouslyReady) return@resume
-            runCatching {
-                val response = ticket.request("dock_glass_probe")
-                response.getString("error")?.let { error(it) }
-                val healthy = ticket.lease?.isAttached == true
-                    && response.getBoolean("backgroundReady")
-                if (healthy) {
-                    val wasReady = ticket.ready
-                    ticket.ready = true
-                    ticket.previouslyReady = true
-                    ticket.consecutiveFailures = 0
-                    if (!wasReady) changed()
-                } else if (!allowFallback) {
-                    // Settle window: the wallpaper swap keeps the producer busy, so an unhealthy
-                    // probe here is expected and transient. Keep the current material on screen
-                    // instead of flashing the compositor fallback and restarting the producer;
-                    // the caller re-probes once the window closes.
-                    record("glass probe unhealthy during settle; keeping current material")
-                } else {
-                    // Put compositor fallback behind the Dock before restarting the
-                    // private producer. This prevents a transparent/white flash.
-                    val wasReady = ticket.ready
-                    ticket.ready = false
-                    if (wasReady) changed()
-                    worker.postDelayed({ hardRefresh(ticket, requestEpoch) }, if (wasReady) 80 else 0)
+        worker.postDelayed({
+            guard("resume probe") {
+                if (closed || ticket.cancelled || ticket.dead || ticket.lease == null) return@guard
+                if (!ticket.gate.isRefreshCurrent(requestEpoch)) {
+                    if (ticket.gate.noteStaleCallback()) {
+                        record("glass stale resume probe id=${ticket.id} epoch=$requestEpoch")
+                    }
+                    return@guard
                 }
-            }.onFailure {
-                recover(ticket, "resume probe ${it.javaClass.simpleName}: ${it.message?.take(160)}")
+                // Initial creation already owns its readiness loop. A resume probe is
+                // meaningful only after this generation has displayed native glass.
+                if (!ticket.gate.isPreviouslyReady()) return@guard
+                catchingRecoverable({
+                    val response = ticket.request("dock_glass_probe")
+                    response.getString("error")?.let { error(it) }
+                    val healthy = ticket.lease?.isAttached == true
+                        && response.getBoolean("backgroundReady")
+                    if (healthy) {
+                        val wasReady = ticket.ready
+                        ticket.ready = true
+                        ticket.gate.markReady()
+                        if (!wasReady) changed()
+                    } else if (!allowFallback) {
+                        // Settle window: the wallpaper swap keeps the producer busy, so an unhealthy
+                        // probe here is expected and transient. Keep the current material on screen
+                        // instead of flashing the compositor fallback and restarting the producer;
+                        // the caller re-probes once the window closes.
+                        record("glass probe unhealthy during settle; keeping current material")
+                    } else {
+                        // Put compositor fallback behind the Dock before restarting the
+                        // private producer. This prevents a transparent/white flash.
+                        val wasReady = ticket.ready
+                        ticket.ready = false
+                        if (wasReady) changed()
+                        worker.postDelayed(
+                            { guard("refresh") { hardRefresh(ticket, requestEpoch) } },
+                            if (wasReady) 80 else 0)
+                    }
+                }) {
+                    recover(ticket, "resume probe ${it.javaClass.simpleName}: ${it.message?.take(160)}")
+                }
             }
         }, 50)
     }
 
     private fun hardRefresh(ticket: Ticket, requestEpoch: Int) {
-        if (closed || ticket.cancelled || ticket.dead || ticket.lease == null
-            || !ticket.refreshAllowed || requestEpoch != ticket.refreshRequestEpoch) return
-        runCatching {
+        if (closed || ticket.cancelled || ticket.dead || ticket.lease == null) return
+        if (!ticket.gate.isRefreshCurrent(requestEpoch)) {
+            if (ticket.gate.noteStaleCallback()) {
+                record("glass stale refresh ignored id=${ticket.id} epoch=$requestEpoch")
+            }
+            return
+        }
+        catchingRecoverable({
             val response = ticket.request("dock_glass_refresh")
             response.getString("error")?.let { error(it) }
             ticket.refreshes++
-            val generation = ticket.attempts
-            val readinessEpoch = ++ticket.readinessEpoch
+            val generation = ticket.gate.getAttempts()
+            val readinessEpoch = ticket.gate.openReadinessEpoch()
             if (ticket.refreshes <= 8) {
                 record("glass stale producer restarted id=${ticket.id} count=${ticket.refreshes}")
             }
             checkBackground(ticket, 0, generation, readinessEpoch)
-        }.onFailure {
+        }) {
             recover(ticket, "refresh ${it.javaClass.simpleName}: ${it.message?.take(160)}")
         }
     }
 
     /** Cancel delayed refresh/readiness work while the launcher parent is hidden. */
     fun pauseRefresh(ticket: Ticket) {
-        synchronized(ticket) {
-            ticket.refreshAllowed = false
-            ticket.refreshRequestEpoch++
-            ticket.lastRefreshRequest = 0
-        }
-        worker.post { ticket.readinessEpoch++ }
+        ticket.gate.pauseRefresh()
+        worker.post { guard("pause refresh") { ticket.gate.invalidateReadiness() } }
     }
 
     private fun recover(ticket: Ticket, reason: String) {
-        if (ticket.cancelled || closed || ticket.recoveryPending) return
         val wasReady = ticket.ready
-        ticket.recoveryPending = true
+        val outcome = ticket.gate.requestRecovery(closed, wasReady)
+        if (outcome == DockGlassRecoveryGate.Outcome.IGNORED) return
         ticket.dead = true
         ticket.ready = false
         dispose(ticket)
-        if (!wasReady) ticket.consecutiveFailures++
-        val delay = DockGlassRetryPolicy.delayAfterRuntimeFailure(
-            ticket.consecutiveFailures, wasReady, ticket.previouslyReady
-        )
-        record("glass failed id=${ticket.id} attempt=${ticket.attempts} reason=$reason retryMs=$delay")
+        record("glass failed id=${ticket.id} attempt=${ticket.gate.getAttempts()} " +
+            "failures=${ticket.gate.getConsecutiveFailures()} " +
+            "deduplicated=${ticket.gate.getDeduplicatedRecoveries()} " +
+            "retryMs=${ticket.gate.getRetryDelayMs()} reason=$reason")
         changed()
-        if (delay >= 0) worker.postDelayed({ attemptCreate(ticket) }, delay)
-        else XposedLog.w("DockGlass", "system", "Glass recovery budget exhausted; retaining fallback")
+        scheduleRetry(ticket, outcome, ticket.gate.getRetryDelayMs())
+    }
+
+    /**
+     * The HyperCeiler package itself is momentarily unresolvable, typically because it is
+     * being replaced by an in-place upgrade.
+     *
+     * <p>Nothing is disposed and no compatibility budget is consumed: this is an external,
+     * self-healing outage. The retry cadence is capped, so a long outage stays bounded.
+     */
+    private fun deferForDependency(ticket: Ticket) {
+        val outcome = ticket.gate.requestDependencyDefer(closed)
+        if (outcome == DockGlassRecoveryGate.Outcome.IGNORED) return
+        ticket.dead = true
+        if (ticket.ready) {
+            ticket.ready = false
+            changed()
+        }
+        if (ticket.gate.shouldReportDependencyDefer()) {
+            record("glass dependency unavailable id=${ticket.id} " +
+                "attempt=${ticket.gate.getAttempts()} retryMs=${ticket.gate.getRetryDelayMs()}")
+        }
+        scheduleRetry(ticket, outcome, ticket.gate.getRetryDelayMs())
+    }
+
+    private fun scheduleRetry(ticket: Ticket, outcome: DockGlassRecoveryGate.Outcome, delayMs: Long) {
+        when (outcome) {
+            DockGlassRecoveryGate.Outcome.RETRY_NOW,
+            DockGlassRecoveryGate.Outcome.RETRY_LATER ->
+                worker.postDelayed({ guard("retry") { attemptCreate(ticket) } }, delayMs)
+            DockGlassRecoveryGate.Outcome.EXHAUSTED ->
+                XposedLog.w("DockGlass", "system", "Glass recovery budget exhausted; retaining fallback")
+            DockGlassRecoveryGate.Outcome.IGNORED -> Unit
+        }
     }
 
     fun release(ticket: Ticket) {
-        ticket.cancelled = true
+        // Retire exactly once: a repeated release must not queue a second teardown, and it
+        // must also cancel every retry/recovery already scheduled for this ticket.
+        if (!ticket.gate.markRetired()) {
+            record("glass release ignored id=${ticket.id} reason=already retired")
+            return
+        }
         record("glass cancelled id=${ticket.id}")
-        worker.post { dispose(ticket) }
+        worker.post { guard("release") { dispose(ticket) } }
     }
 
     fun close() {
+        if (closed) return
+        // Marking the client closing first stops every later task from touching resources,
+        // including retries already posted by recover().
         closed = true
         if (workerDelegate.isInitialized()) worker.post {
-            journal.finish()
+            guard("closing") {
+                journal.record("glass client closing")
+                journal.finish()
+            }
             worker.looper.quitSafely()
         }
     }
 
     private fun dispose(ticket: Ticket): Boolean {
         ticket.ready = false
-        ticket.death?.let { runCatching { ticket.lifetime?.unlinkToDeath(it, 0) } }
+        ticket.death?.let { catchingRecoverable({ ticket.lifetime?.unlinkToDeath(it, 0) }) }
         ticket.death = null
         ticket.lifetime = null
         try {
@@ -376,9 +480,9 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
         ticket.parcel = null
         // Do not reacquire/start a renderer merely to release a failed acquisition.
         try {
-            if (ticket.client != null) runCatching { ticket.request("dock_glass_release") }
+            if (ticket.client != null) catchingRecoverable({ ticket.request("dock_glass_release") })
         } finally {
-            runCatching { ticket.client?.close() }
+            catchingRecoverable({ ticket.client?.close() })
             ticket.client = null
             processGuard.release(ticket)
         }

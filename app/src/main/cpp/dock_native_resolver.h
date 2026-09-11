@@ -1,5 +1,19 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
+/*
+ * Desktop Dart AOT semantic resolver.
+ *
+ * Everything ARM64-generic (register fields, branches, load/store shapes,
+ * PC-relative reconstruction, materialized constants, bitfield extraction)
+ * moved to nativehook/arm64_decode.h so Rust/C resolvers reuse it; this file
+ * keeps only what is genuinely Dart: the prologue shape, the compressed
+ * pointer convention (x28 heap base, LSL #32), the allocation-tag ABI and the
+ * scale/animate/set semantic relation. Resolution is fail closed by
+ * construction: any ambiguity returns nothing at all.
+ */
 #pragma once
+#include "nativehook/arm64_decode.h"
+#include "nativehook/resolver.h"
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -9,15 +23,34 @@
 #include <vector>
 
 namespace dock_motion {
-struct CodeRange {
-    uintptr_t address;
-    std::span<const uint32_t> words;
-    bool contains(uintptr_t location, size_t count = 1) const {
-        if (location < address || (location - address) % sizeof(uint32_t) != 0) return false;
-        const auto index = (location - address) / sizeof(uint32_t);
-        return index <= words.size() && count <= words.size() - index;
-    }
-};
+
+// The desktop inline patch is four ARM64 words (the backend's trampoline shape).
+inline constexpr size_t kPatchTargetWords = 4;
+
+using nhk::arm64::CodeRange;
+using nhk::arm64::Match;
+using nhk::arm64::rd;
+using nhk::arm64::rn;
+using nhk::arm64::rm;
+using nhk::arm64::is_bl;
+using nhk::arm64::is_b;
+using nhk::arm64::is_ret;
+using nhk::arm64::is_ldur_w;
+using nhk::arm64::is_ldur_x;
+using nhk::arm64::is_ldur_d;
+using nhk::arm64::is_stur_w;
+using nhk::arm64::is_stur_x;
+using nhk::arm64::is_stur_d;
+using nhk::arm64::memory_offset;
+using nhk::arm64::is_add_imm_x;
+using nhk::arm64::add_imm;
+using nhk::arm64::branch_target;
+using nhk::arm64::call_target;
+using nhk::arm64::at;
+using nhk::arm64::materialized_u32;
+using nhk::arm64::ubfx;
+using nhk::arm64::lsl_amount;
+using nhk::arm64::kMaxFunctionWords;
 
 struct Layout {
     uint32_t params_class_id;
@@ -56,89 +89,21 @@ inline bool same_resolution(const Resolution &left, const Resolution &right) {
     return left.scale == right.scale && left.animate == right.animate
         && left.set == right.set && same_layout(left.layout, right.layout);
 }
-struct Match {
-    uintptr_t address;
-    std::span<const uint32_t> words;
-};
 
-inline constexpr size_t kMaxFunctionWords = 768;
-inline uint32_t rd(uint32_t word) { return word & 0x1f; }
-inline uint32_t rn(uint32_t word) { return (word >> 5) & 0x1f; }
-inline uint32_t rm(uint32_t word) { return (word >> 16) & 0x1f; }
-inline bool is_bl(uint32_t word) { return (word & 0xfc000000) == 0x94000000; }
-inline bool is_b(uint32_t word) { return (word & 0xfc000000) == 0x14000000; }
-inline bool is_ret(uint32_t word) { return word == 0xd65f03c0; }
 inline bool is_dart_prologue(std::span<const uint32_t> words) {
     return words.size() >= 2 && words[0] == 0xa9bf79fd && words[1] == 0xaa0f03fd;
 }
-inline bool is_ldur_w(uint32_t word) { return (word & 0xffe00c00) == 0xb8400000; }
-inline bool is_ldur_x(uint32_t word) { return (word & 0xffe00c00) == 0xf8400000; }
-inline bool is_ldur_d(uint32_t word) { return (word & 0xffe00c00) == 0xfc400000; }
-inline bool is_stur_w(uint32_t word) { return (word & 0xffe00c00) == 0xb8000000; }
-inline bool is_stur_x(uint32_t word) { return (word & 0xffe00c00) == 0xf8000000; }
-inline bool is_stur_d(uint32_t word) { return (word & 0xffe00c00) == 0xfc000000; }
-inline int memory_offset(uint32_t word) {
-    int value = static_cast<int>((word >> 12) & 0x1ff);
-    return value >= 0x100 ? value - 0x200 : value;
-}
-inline bool is_add_imm_x(uint32_t word) { return (word & 0xff000000) == 0x91000000; }
-inline uint32_t add_imm(uint32_t word) {
-    const uint32_t value = (word >> 10) & 0xfff;
-    return ((word >> 22) & 1) != 0 ? value << 12 : value;
-}
+
+/**
+ * Dart compressed-pointer convention: a tagged object is
+ * `(heap_base << 32) | raw`, and decompression adds the heap base from x28
+ * shifted left by 32. Recognizing the exact shape is what lets the resolver
+ * tell field loads of the receiver apart from unrelated spills.
+ */
 inline bool is_compressed_pointer_add(uint32_t word) {
     return (word & 0xff200000) == 0x8b000000 && rn(word) == rd(word)
         && ((word >> 22) & 3) == 0 // ADD (shifted register), LSL only.
         && rm(word) == 28 && ((word >> 10) & 0x3f) == 32;
-}
-
-inline std::optional<uintptr_t> branch_target(uintptr_t pc, uint32_t word, bool link) {
-    if ((word & 0xfc000000) != (link ? 0x94000000u : 0x14000000u)) return {};
-    int64_t displacement = word & 0x03ffffff;
-    if ((displacement & 0x02000000) != 0) displacement -= 0x04000000;
-    displacement *= 4;
-    if (displacement < 0 && pc < static_cast<uintptr_t>(-displacement)) return {};
-    if (displacement > 0 && pc > UINTPTR_MAX - static_cast<uintptr_t>(displacement)) return {};
-    return displacement < 0 ? pc - static_cast<uintptr_t>(-displacement)
-                            : pc + static_cast<uintptr_t>(displacement);
-}
-inline std::optional<uintptr_t> call_target(const Match &match, size_t index) {
-    if (index >= match.words.size()) return {};
-    return branch_target(match.address + index * sizeof(uint32_t), match.words[index], true);
-}
-inline std::span<const uint32_t> at(std::span<const CodeRange> ranges,
-    uintptr_t address, size_t count) {
-    for (const auto &range : ranges) {
-        if (range.contains(address, count)) {
-            return range.words.subspan((address - range.address) / sizeof(uint32_t), count);
-        }
-    }
-    return {};
-}
-inline std::optional<uint32_t> materialized_u32(std::span<const uint32_t> words,
-    uint32_t reg) {
-    if (words.size() < 2 || (words[0] & 0xff80001f) != (0xd2800000 | reg)
-        || (words[1] & 0xff80001f) != (0xf2800000 | reg)
-        || ((words[0] >> 21) & 3) != 0
-        || ((words[1] >> 21) & 3) != 1) return {};
-    return ((words[0] >> 5) & 0xffff) | (((words[1] >> 5) & 0xffff) << 16);
-}
-inline std::optional<std::pair<uint32_t, uint32_t>> ubfx(uint32_t word,
-    uint32_t source, uint32_t destination) {
-    if ((word & 0xffc00000) != 0xd3400000 || rn(word) != source || rd(word) != destination) {
-        return {};
-    }
-    const uint32_t shift = (word >> 16) & 0x3f;
-    const uint32_t last = (word >> 10) & 0x3f;
-    if (last < shift) return {};
-    return std::pair{shift, last - shift + 1};
-}
-inline std::optional<uint32_t> lsl_amount(uint32_t word, uint32_t reg) {
-    if ((word & 0xffc00000) != 0xd3400000 || rn(word) != reg || rd(word) != reg) return {};
-    const uint32_t rotate = (word >> 16) & 0x3f;
-    const uint32_t last = (word >> 10) & 0x3f;
-    if (rotate == 0 || last + 1 != rotate) return {};
-    return 64 - rotate;
 }
 
 inline std::vector<Match> functions(std::span<const CodeRange> ranges) {
@@ -542,7 +507,18 @@ inline std::optional<Match> animate_function(std::span<const CodeRange> ranges,
     return result;
 }
 
-inline std::optional<Resolution> resolve(std::span<const CodeRange> ranges) {
+/**
+ * Resolve the dock's scale/animate/set triple.
+ *
+ * `candidate_count` (optional) reports the fail-closed gate's view: 0 = no
+ * candidate, 1 = exactly one (proceed), >= 2 = several distinct resolutions
+ * existed and the run was refused rather than picking one. This keeps the
+ * 0/1/many contract visible to the runtime instead of hiding it inside a
+ * bare empty optional.
+ */
+inline std::optional<Resolution> resolve(std::span<const CodeRange> ranges,
+    size_t *candidate_count = nullptr) {
+    if (candidate_count != nullptr) *candidate_count = 0;
     for (size_t left = 0; left < ranges.size(); ++left) {
         const uintptr_t left_bytes = ranges[left].words.size_bytes();
         if (left_bytes > UINTPTR_MAX - ranges[left].address) return {};
@@ -579,12 +555,56 @@ inline std::optional<Resolution> resolve(std::span<const CodeRange> ranges) {
                         factory.false_from_null}};
                 if (result) {
                     if (same_resolution(*result, candidate)) continue;
+                    // Two distinct resolutions: refuse, and tell the runtime how many
+                    // collided so the refusal is distinguishable from "not found".
+                    if (candidate_count != nullptr) *candidate_count = 2;
                     return {};
                 }
                 result = candidate;
             }
         }
     }
+    if (candidate_count != nullptr && result) *candidate_count = 1;
+    return result;
+}
+
+/**
+ * Contract-shaped output for the NativeHookRuntime: the same resolution plus
+ * the three inline hook points as `nhk::ResolvedTarget`s (original words
+ * attached) and the resolver evidence. Addresses are absolute runtime
+ * addresses of the snapshotted generation; `rva` is filled by the caller,
+ * which knows the generation's load bias.
+ */
+struct DartHookTargets {
+    Resolution resolution;
+    std::array<nhk::ResolvedTarget, 3> targets;
+    nhk::ResolverEvidence evidence;
+};
+
+inline std::optional<DartHookTargets> resolve_hook_targets(
+    std::span<const CodeRange> ranges, uint64_t load_bias) {
+    size_t candidates = 0;
+    const auto resolution = resolve(ranges, &candidates);
+    DartHookTargets result;
+    result.evidence.candidate_count = candidates;
+    result.evidence.stage = candidates == 1 ? "dart-semantic-unique"
+        : candidates == 0 ? "dart-semantic-not-found" : "dart-semantic-ambiguous";
+    if (!resolution) return {};
+    const uintptr_t addresses[3] = {resolution->scale, resolution->animate,
+        resolution->set};
+    for (size_t i = 0; i < 3; ++i) {
+        auto &target = result.targets[i];
+        target.kind = nhk::TargetKind::kInline;
+        target.rva = addresses[i] >= load_bias ? addresses[i] - load_bias : 0;
+        const auto words = at(ranges, addresses[i], kPatchTargetWords);
+        target.original_words.assign(words.begin(), words.end());
+        // The snapshot must be able to supply the prologue the runtime will
+        // verify against live memory; a short read means the resolution cannot
+        // be handed over safely.
+        if (target.original_words.size() != kPatchTargetWords) return {};
+        result.evidence.call_sites.push_back(target.rva);
+    }
+    result.resolution = *resolution;
     return result;
 }
 } // namespace dock_motion

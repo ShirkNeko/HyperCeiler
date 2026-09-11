@@ -65,6 +65,7 @@ javac -d "$dock_test_dir" \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockWallpaperEndpoint.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockNativeMotion.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockNativeMotionEndpoint.java \
+  library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassRecoveryGate.java \
   tests/home-dock-window/stubs/android/os/IBinder.java \
   tests/home-dock-window/stubs/android/os/Binder.java \
   tests/home-dock-window/stubs/android/os/Parcel.java \
@@ -76,8 +77,9 @@ javac -d "$dock_test_dir" \
   tests/home-dock-window/DockGlassProcessPolicyTest.java \
   tests/home-dock-window/DockWallpaperEndpointTest.java \
   tests/home-dock-window/DockNativeMotionTest.java \
-  tests/home-dock-window/DockNativeMotionEndpointTest.java
-for test in DockWindowPolicy DockGlassPreset DockRecentsMotion DockGlassRetryPolicy DockGlassSurfaceLease DockGlassProcessPolicy DockWallpaperEndpoint DockNativeMotion DockNativeMotionEndpoint; do
+  tests/home-dock-window/DockNativeMotionEndpointTest.java \
+  tests/home-dock-window/DockGlassRecoveryGateTest.java
+for test in DockWindowPolicy DockGlassPreset DockRecentsMotion DockGlassRetryPolicy DockGlassSurfaceLease DockGlassProcessPolicy DockWallpaperEndpoint DockNativeMotion DockNativeMotionEndpoint DockGlassRecoveryGate; do
   java -cp "$dock_test_dir" "com.sevtinge.hyperceiler.tests.dock.${test}Test"
 done
 ```
@@ -125,6 +127,24 @@ and rechecks readiness; the native layer is not exposed while that restart draws
 
 `DockGlassRetryPolicyTest` verifies the backoff/readiness limits on the host JDK.
 Actual boot-time recovery and cancellation still require device verification.
+
+Every asynchronous glass entry point runs behind one boundary that catches
+`Exception` only; `Error` and other VM-fatal throwables are never swallowed, so
+the renderer path can no longer escape into the system-server uncaught handler.
+The same restriction applies to the recoverable-failure helper used for
+attachment, probe, refresh and cleanup: Kotlin's `runCatching` catches
+`Throwable`, so it is deliberately not used here.
+A temporarily unavailable renderer package is treated as a retryable dependency
+outage rather than a hard failure: `PackageManager.NameNotFoundException` fails
+the attempt safely and schedules a bounded 1/2/4/8/16/30s retry that never
+exhausts and does not consume the compatibility budget. The resolved renderer UID
+is cached and reused only while `getPackagesForUid` still attributes it to the
+package; no `Context`, `ClassLoader` or file reference is cached across upgrades.
+Recovery is single-flight: a duplicate request while one is pending is ignored and
+counted, retired tickets reject stale generation/readiness/refresh callbacks, and
+`release` is idempotent. `DockGlassRecoveryGateTest` covers the outage, the
+single-flight latch, the exhausted budget, stale generations, idempotent
+retirement, refresh deduplication and closed-client admission.
 
 The diagnostic build records a bounded history (96 metadata events) in
 HyperCeiler's private device-protected storage, independently of release logging

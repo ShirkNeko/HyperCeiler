@@ -19,6 +19,7 @@
 package com.sevtinge.hyperceiler.libhook.rules.home.dock
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.util.Log
 import io.github.lingqiqi5211.ezhooktool.core.loadClass
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.createBeforeHook
@@ -28,6 +29,16 @@ import java.util.ArrayList
 internal class DockGlassProcessGuard {
     private val policy = DockGlassProcessPolicy()
     private var serviceClass: Class<*>? = null
+
+    /**
+     * UID of the HyperCeiler package.
+     *
+     * <p>An upgrade keeps the UID and it outlives every renderer restart, so a successful
+     * lookup is cached and re-validated with {@code getPackagesForUid} instead of asking
+     * {@code PackageManager} for the application record on every recovery attempt. That call
+     * is the fragile one: it is what throws while the package is mid-replacement.
+     */
+    @Volatile private var cachedUid = -1
     @Volatile private var closed = false
 
     fun install() {
@@ -45,7 +56,7 @@ internal class DockGlassProcessGuard {
                 if (!closed && original != null) {
                     val filtered = policy.filter(original, pids) { pid ->
                         // Check only candidate renderer PIDs, avoiding a PID-reuse exemption.
-                        runCatching { pidUid.invoke(null, pid) as Int }.getOrDefault(-1)
+                        catchingRecoverableOr(-1) { pidUid.invoke(null, pid) as Int }
                     }
                     if (filtered !== original) {
                         if (filtered.isEmpty()) param.result = ArrayList<Int>()
@@ -65,7 +76,7 @@ internal class DockGlassProcessGuard {
             val config = param.args[0] ?: return@createBeforeHook
             if (closed || getPolicy.invoke(config) != 1 ||
                 !policy.hasLiveOwner { pid ->
-                    runCatching { pidUid.invoke(null, pid) as Int }.getOrDefault(-1)
+                    catchingRecoverableOr(-1) { pidUid.invoke(null, pid) as Int }
                 }) return@createBeforeHook
 
             val existing = getWhiteList.invoke(config) as? List<*>
@@ -79,14 +90,52 @@ internal class DockGlassProcessGuard {
         serviceClass = clazz
     }
 
-    // Called only on the IPC worker; no PackageManager or thaw calls under WM locks.
-    fun acquire(context: Context, token: Any) {
+    /**
+     * Resolve the UID whose renderer lease this ticket is allowed to protect.
+     *
+     * @return the UID, or {@code null} when the package is momentarily unresolvable — an
+     *         in-place upgrade, an uninstall in flight, or a `PackageManager` that is busy.
+     *         That is a transient dependency outage, not a defect of this ticket, so it is
+     *         reported as such instead of being thrown at the caller.
+     */
+    private fun resolveUid(context: Context): Int? {
+        val pm = context.packageManager
+        val cached = cachedUid
+        if (cached >= 0) {
+            // Unknown UID (uninstall, or a PM outage) returns null and falls through to the
+            // authoritative lookup; anything else must still be owned by our package alone.
+            val owners = pm.getPackagesForUid(cached)
+            if (owners != null) {
+                if (owners.size == 1 && owners[0] == PACKAGE_NAME) return cached
+                cachedUid = -1 // Reinstalled under a new UID.
+            }
+        }
+        val info = try {
+            pm.getApplicationInfo(PACKAGE_NAME, 0)
+        } catch (error: PackageManager.NameNotFoundException) {
+            Log.i("HyperCeiler.DockGlass",
+                "Renderer package temporarily unavailable: ${error.message?.take(160)}")
+            return null
+        }
+        val owners = pm.getPackagesForUid(info.uid)
+        check(owners?.size == 1 && owners[0] == PACKAGE_NAME) { "Renderer UID ownership is ambiguous" }
+        cachedUid = info.uid
+        return info.uid
+    }
+
+    /**
+     * Acquire the freezer exemption for [token].
+     *
+     * <p>Called only on the IPC worker: no `PackageManager` or thaw call happens under WM locks.
+     *
+     * @return false when the HyperCeiler package is temporarily unresolvable. The caller must
+     *         then schedule a bounded retry; no lease was taken, so there is nothing to undo.
+     *         Every other failure still throws, and no VM-fatal error is ever swallowed.
+     */
+    fun acquire(context: Context, token: Any): Boolean {
         check(!closed) { "Renderer guard closed" }
         val clazz = checkNotNull(serviceClass) { "OS4 renderer lifecycle API unavailable" }
-        val pkg = PACKAGE_NAME
-        val uid = context.packageManager.getApplicationInfo(pkg, 0).uid
-        val packages = context.packageManager.getPackagesForUid(uid)
-        check(packages?.size == 1 && packages[0] == pkg) { "Renderer UID ownership is ambiguous" }
+        val uid = resolveUid(context) ?: return false
         policy.acquire(token, uid)
         var ready = false
         try {
@@ -108,6 +157,7 @@ internal class DockGlassProcessGuard {
             // No failed/partial acquisition may leave an unowned freezer exemption.
             if (!ready) policy.release(token)
         }
+        return true
     }
 
     fun setPid(token: Any, pid: Int) { policy.setPid(token, pid) }

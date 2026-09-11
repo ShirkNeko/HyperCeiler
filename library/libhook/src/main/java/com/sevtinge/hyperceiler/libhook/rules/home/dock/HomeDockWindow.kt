@@ -209,9 +209,20 @@ class HomeDockWindow : BaseHook() {
     @Volatile private var directMotionAvailable = true
     // Owned and used only on WMS's handler thread, never the host window transaction.
     private var animationFrameClock: FrameClock? = null
+    // Every clock ever created is retained for the whole process lifetime. A dropped
+    // reference would let the finalizer dispose the native receiver while the looper
+    // may still hold a dispatched vsync callback - the exact system_server SIGSEGV in
+    // DisplayEventReceiver::getLatestVsyncEventData this design exists to prevent.
+    private val retainedFrameClocks = ArrayList<FrameClock>(2)
+    private var abandonedFrameClocks = 0
+    private var frameChannelFailed = false
     private var motionTransaction: Any? = null
     private var scheduledFrame: ScheduledFrame? = null
     private var directRecoveryDelay = 100L
+    // A dedicated clock costs one fd and a small native dispatcher; four abandoned
+    // channels mean the display pipeline is fundamentally unhappy with us, so past
+    // this point direct motion stays off until the next system_server lifetime.
+    private val FRAME_CLOCK_ABANDON_CAP = 4
 
     override fun init() {
         refreshSettings()
@@ -240,7 +251,6 @@ class HomeDockWindow : BaseHook() {
                 cancelScheduledFrame()
                 runCatching { motionTransaction?.callMethod("close") }
                 motionTransaction = null
-                retireFrameClock()
                 directRecoveryScheduled.set(false)
                 nativeBindSweepScheduled.set(false)
             }
@@ -1088,12 +1098,13 @@ class HomeDockWindow : BaseHook() {
         }.onFailure {
             // Wallpaper/display replacement and suspend can invalidate a cached frame clock or
             // transaction temporarily. Keep the static background, but rebuild the direct path;
-            // permanently disabling it makes all later gestures lose real-time following.
+            // permanently disabling it makes all later gestures lose real-time following. The
+            // clock itself is kept alive and reused: disposing it here is what used to race a
+            // queued vsync callback into a system_server SIGSEGV.
             directMotionAvailable = false
             runCatching { motionTransaction?.callMethod("close") }
             motionTransaction = null
-            retireFrameClock(frameClock)
-            glassClient.record("motion direct frame unavailable=${it.javaClass.simpleName}; rebuilding frame channel")
+            glassClient.record("motion direct frame unavailable=${it.javaClass.simpleName}")
             requestTraversal()
             scheduleDirectMotionRecovery()
         }
@@ -1237,45 +1248,100 @@ class HomeDockWindow : BaseHook() {
     }
 
     private fun createFrameClock(handler: Handler): FrameClock {
-        // OS4 exposes a factory for a non-ThreadLocal Choreographer. Owning the receiver lets us
-        // dispose and truly recreate a channel whose mFrameScheduled stayed latched over suspend;
-        // releasing either system ThreadLocal instance would break unrelated WMS callbacks.
-        val dedicatedAttempt = runCatching {
-            Choreographer::class.java.getDeclaredMethod(
-                "getInstanceForSurfaceControl", Long::class.javaPrimitiveType, Looper::class.java)
-                .apply { isAccessible = true }
-                .invoke(null, 0L, handler.looper) as Choreographer
-        }
-        val dedicated = dedicatedAttempt.getOrNull()
-        dedicatedAttempt.exceptionOrNull()?.let {
-            if (observed.add("native-motion-dedicated-clock")) {
-                glassClient.record("motion dedicated frame clock unavailable=${it.javaClass.simpleName}")
-            }
+        // OS4 exposes a factory for a non-ThreadLocal Choreographer. We keep it for the
+        // whole process lifetime: the receiver is never disposed (a disposed receiver is
+        // what crash-looped system_server via getLatestVsyncEventData), so a latched
+        // channel is recovered by un-latching or replaced by abandoning the old instance.
+        var dedicated: Choreographer? = null
+        var dedicatedError: Exception? = null
+        catchingRecoverable(
+            {
+                Choreographer::class.java.getDeclaredMethod(
+                    "getInstanceForSurfaceControl", Long::class.javaPrimitiveType, Looper::class.java)
+                    .apply { isAccessible = true }
+                    .invoke(null, 0L, handler.looper) as Choreographer
+            },
+            { dedicatedError = it }
+        )
+        if (dedicated == null && dedicatedError != null
+            && observed.add("native-motion-dedicated-clock")) {
+            glassClient.record("motion dedicated frame clock unavailable=${dedicatedError.javaClass.simpleName}")
         }
         val clock = if (dedicated != null) {
             FrameClock(dedicated, true)
         } else {
-            val shared = runCatching {
-                Choreographer::class.java.getDeclaredMethod("getSfInstance")
-                    .apply { isAccessible = true }
-                    .invoke(null) as Choreographer
-            }.getOrElse { Choreographer.getInstance() }
-            FrameClock(shared, false)
+            var shared: Choreographer? = null
+            catchingRecoverable(
+                {
+                    Choreographer::class.java.getDeclaredMethod("getSfInstance")
+                        .apply { isAccessible = true }
+                        .invoke(null) as Choreographer
+                },
+                { }
+            )
+            FrameClock(shared ?: Choreographer.getInstance(), false)
         }
+        retainedFrameClocks.add(clock)
         animationFrameClock = clock
         glassClient.record("motion frame clock ready direct=$directMotionAvailable owned=${clock.owned}")
         return clock
     }
 
-    private fun retireFrameClock(expected: FrameClock? = animationFrameClock) {
-        if (expected == null) return
-        if (animationFrameClock === expected) animationFrameClock = null
-        if (expected.owned) runCatching {
-            Choreographer::class.java.getDeclaredMethod("invalidate")
-                .apply { isAccessible = true }
-                .invoke(expected.choreographer)
+    /**
+     * Recover a frame clock channel that stopped delivering frames.
+     *
+     * <p>Runs on android.display, so every state it touches mutates on the owning thread.
+     * The recovery ladder, cheapest and safest first:
+     *  1. Un-latch: suspend can leave `mFrameScheduled` set with the pending vsync lost,
+     *     after which Choreographer refuses to issue a new request. Resetting the flag on
+     *     the owning thread and re-posting re-arms the SAME live receiver - no disposal,
+     *     so the disposed-receiver race can never occur.
+     *  2. Abandon: if un-latching fails the receiver itself is suspect. The clock is kept
+     *     referenced (never disposed, so its finalizer can never race a queued callback)
+     *     and a fresh instance is created. Capped: a display pipeline that burned four
+     *     channels stays on traversal fallback until the next system_server lifetime.
+     */
+    private fun recoverFrameChannel(reason: String) {
+        val clock = animationFrameClock
+        if (clock != null && unlatchFrameClock(clock)) {
+            animationAvailable = true
+            directMotionAvailable = true
+            glassClient.record("motion frame channel unlatched reason=$reason")
+            scheduleAnimationFrame()
+            return
         }
+        if (clock != null && clock.owned && abandonedFrameClocks < FRAME_CLOCK_ABANDON_CAP) {
+            abandonedFrameClocks++
+            // The abandoned instance stays alive inside retainedFrameClocks forever: its
+            // finalizer would dispose the native receiver, and a queued callback touching
+            // it is the system_server crash this whole design prevents.
+            animationFrameClock = null
+            animationAvailable = true
+            directMotionAvailable = true
+            glassClient.record("motion frame channel abandoned count=$abandonedFrameClocks reason=$reason")
+            scheduleAnimationFrame()
+            return
+        }
+        animationAvailable = true
+        directMotionAvailable = false
+        frameChannelFailed = true
+        glassClient.record("motion frame channel failed closed reason=$reason abandoned=$abandonedFrameClocks")
+        requestTraversal()
     }
+
+    /**
+     * Clear the latched `mFrameScheduled` flag of a stalled clock, on the thread that owns
+     * it. Returns false when the field is unavailable on this build - then the caller falls
+     * through to abandon-and-recreate. Never disposes anything.
+     */
+    private fun unlatchFrameClock(clock: FrameClock): Boolean = runCatching {
+        Choreographer::class.java.getDeclaredField("mFrameScheduled")
+            .apply { isAccessible = true }
+            .setBoolean(clock.choreographer, false)
+        true
+    }.onFailure {
+        glassClient.record("motion frame unlatch unavailable=${it.javaClass.simpleName}")
+    }.getOrDefault(false)
 
     private fun hasPendingMotionFrame(): Boolean {
         val now = SystemClock.uptimeMillis()
@@ -1336,13 +1402,14 @@ class HomeDockWindow : BaseHook() {
                 handler.postDelayed({ recoverStalledFrame(epoch) }, 100)
             }.onFailure {
                 // Never let an optional animation callback throw on a system handler thread.
+                // The clock is NOT disposed here - keep it retained and let the recovery
+                // probe reuse it; if it keeps failing the stall detector escalates to the
+                // recoverFrameChannel ladder, which abandons instead of disposing.
                 animationAvailable = false
                 clearScheduledFrame(epoch)
                 glassClient.record("motion scheduling failed=${it.javaClass.simpleName}: ${it.message?.take(160)}")
-                XposedLog.w(TAG, LOG_TAG, "Dock animation scheduling unavailable; rebuilding frame channel", it)
+                XposedLog.w(TAG, LOG_TAG, "Dock animation scheduling unavailable; retrying on the retained clock", it)
                 requestTraversal()
-                directMotionAvailable = false
-                retireFrameClock()
                 scheduleDirectMotionRecovery()
             }
         }
@@ -1372,11 +1439,11 @@ class HomeDockWindow : BaseHook() {
             runCatching { scheduled.clock.choreographer.removeFrameCallback(scheduled.callback) }
         }
         if (!clearScheduledFrame(epoch)) return
-        retireFrameClock(scheduled?.clock ?: animationFrameClock)
-        glassClient.record("motion frame callback stalled; rebuilding frame clock epoch=$epoch")
-        // Screen-off legitimately has no vsync. Retry immediately only while a real motion
-        // sample/local curve is live; an idle keepalive must not start a 10 Hz recovery loop.
-        if (hasPendingMotionFrame()) scheduleAnimationFrame()
+        // Screen-off legitimately has no vsync, and an idle keepalive must not start a
+        // 10 Hz recovery loop. Recover the channel only while something needs a frame.
+        if (!hasPendingMotionFrame()) return
+        glassClient.record("motion frame callback stalled epoch=$epoch")
+        recoverFrameChannel("stalled")
     }
 
     private fun scheduleDirectMotionRecovery() {
@@ -1387,9 +1454,8 @@ class HomeDockWindow : BaseHook() {
         directRecoveryDelay = (directRecoveryDelay * 2).coerceAtMost(5_000L)
         handler.postDelayed({
             directRecoveryScheduled.set(false)
-            if (stopped) return@postDelayed
+            if (stopped || frameChannelFailed) return@postDelayed
             cancelScheduledFrame()
-            retireFrameClock()
             animationAvailable = true
             directMotionAvailable = true
             glassClient.record("motion direct frame retry after lifecycle interruption delayMs=$delay")

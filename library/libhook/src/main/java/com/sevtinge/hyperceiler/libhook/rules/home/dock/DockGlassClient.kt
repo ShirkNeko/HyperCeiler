@@ -250,7 +250,7 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
     }
 
     /** Verify HyperCeiler's own texture after its parent becomes visible again. */
-    fun resume(ticket: Ticket) {
+    fun resume(ticket: Ticket, allowFallback: Boolean = true) {
         val requestedAt = SystemClock.uptimeMillis()
         val requestEpoch: Int
         synchronized(ticket) {
@@ -279,6 +279,12 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
                     ticket.previouslyReady = true
                     ticket.consecutiveFailures = 0
                     if (!wasReady) changed()
+                } else if (!allowFallback) {
+                    // Settle window: the wallpaper swap keeps the producer busy, so an unhealthy
+                    // probe here is expected and transient. Keep the current material on screen
+                    // instead of flashing the compositor fallback and restarting the producer;
+                    // the caller re-probes once the window closes.
+                    record("glass probe unhealthy during settle; keeping current material")
                 } else {
                     // Put compositor fallback behind the Dock before restarting the
                     // private producer. This prevents a transparent/white flash.

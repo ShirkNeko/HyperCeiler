@@ -63,6 +63,8 @@ class HomeDockWindow : BaseHook() {
         const val TRANSACTION = "android.view.SurfaceControl\$Transaction"
         const val STALE_FRAME_NS = 50_000_000L
         const val NATIVE_BIND_SWEEP_MS = 1_000L
+        /** Reveal (821ms) plus a margin for the keyguard/home wallpaper swap to settle. */
+        const val MATERIAL_SETTLE_MS = 1_600L
     }
     private object Surfaces {
         fun buildLayer(name: String, parent: Any, color: Boolean): Any {
@@ -163,6 +165,18 @@ class HomeDockWindow : BaseHook() {
 
     // TODO(twitch-diag): rate limit for the temporary frame-write trace.
     private var lastFrameDbgUptime = 0L
+
+    /**
+     * Whether the unlock's wallpaper-swap settle window is active.
+     *
+     * While the keyguard and home wallpapers differ, the transition swaps them, which flips the
+     * glass darkness probe and would tear the material down and rebuild it mid-transition - the
+     * flash the user sees as "sampling two different wallpapers". During this window the dock
+     * keeps its current material (and the reveal's fade-in hides most of that period anyway);
+     * exactly one rebuild is allowed once the window closes.
+     */
+    private fun materialSettleActive(): Boolean =
+        pendingRevealAt >= 0L && SystemClock.uptimeMillis() - pendingRevealAt <= MATERIAL_SETTLE_MS
     private var commandSamples = 0
     private val processGuard = DockGlassProcessGuard()
     private val glassClient = DockGlassClient(processGuard) { requestTraversal() }
@@ -546,7 +560,13 @@ class HomeDockWindow : BaseHook() {
                 layer.motion.finish()
             }
             val glass = updateGlass(layer, config, bounds, dark, visible)
-            if (visible && layer.lastVisible == false && glass != null) glassClient.resume(glass)
+            if (visible && layer.lastVisible == false && glass != null) {
+                // During the settle window an unhealthy probe must not drop the dock to the
+                // compositor fallback: the wallpaper swap makes the producer transiently busy,
+                // and a fallback/native round-trip right there is exactly the flash to avoid.
+                // The post-settle traversal re-runs resume with fallbacks enabled.
+                glassClient.resume(glass, allowFallback = !materialSettleActive())
+            }
             if (!visible && layer.lastVisible == true && glass != null) glassClient.pauseRefresh(glass)
             layer.lastVisible = visible
             val appearance = Appearance(config, bounds, dark, visible, glass)
@@ -598,14 +618,18 @@ class HomeDockWindow : BaseHook() {
 
         private fun updateGlass(layer: Layer, config: Settings, bounds: DockWindowPolicy.Bounds,
             dark: Boolean, visible: Boolean): DockGlassClient.Ticket? {
-            val glassKey = "${bounds.width()}/${bounds.height()}/${bounds.radius()}/$dark"
+            // Inside the wallpaper-swap settle window keep the existing ticket: releasing and
+            // rebuilding the glass while the keyguard and home wallpapers are swapping is the
+            // "samples two different wallpapers" flash. One rebuild happens after the window.
+            val settledDark = if (materialSettleActive() && layer.glass != null) layer.glass!!.dark else dark
+            val glassKey = "${bounds.width()}/${bounds.height()}/${bounds.radius()}/$settledDark"
             if (!config.glass || layer.glass?.key?.let { it != glassKey } == true) {
                 layer.glass?.let { glassClient.release(it) }
                 layer.glass = null
             }
             if (config.glass && visible && layer.glass == null) {
                 val context = service!!.getObjectFieldAs<Context>("mContext")
-                layer.glass = glassClient.create(context, glassKey, bounds, dark)
+                layer.glass = glassClient.create(context, glassKey, bounds, settledDark)
             }
             return layer.glass
         }
@@ -828,6 +852,11 @@ class HomeDockWindow : BaseHook() {
             // unconditionally once the whole window has elapsed.
             wm.getObjectFieldAs<Handler>(WM_HANDLER)
                 .postDelayed({ resetStuckReveal() }, DockUnlockReveal.SETTLE_MS)
+            // Close the wallpaper-swap settle window: this traversal applies the home
+            // wallpaper's darkness in exactly one material rebuild, and re-probes the
+            // producer with fallbacks enabled in case it went unhealthy mid-transition.
+            wm.getObjectFieldAs<Handler>(WM_HANDLER)
+                .postDelayed({ requestTraversal() }, MATERIAL_SETTLE_MS + 100L)
         }.onFailure {
             glassClient.record("unlock reveal prepare failed=${it.javaClass.simpleName}")
         }

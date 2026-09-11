@@ -52,8 +52,9 @@ public final class DockUnlockReveal {
      *
      * <p>This is the one knob that governs how pronounced the fly-in feels. It is safe to raise it:
      * the layer is posed before it is ever drawn, so the start offset cannot be seen as a jump.
+     * 22dp read as too subtle on the reference device; 34dp is the current value.
      */
-    public static final float RISE_DP = 22f;
+    public static final float RISE_DP = 34f;
     /**
      * The reveal fades in ahead of the geometry. A value above 1 lands full opacity before the
      * rise settles, which keeps the dock from lingering as a half-transparent ghost.

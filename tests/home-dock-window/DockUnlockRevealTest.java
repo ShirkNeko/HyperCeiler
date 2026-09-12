@@ -17,6 +17,8 @@ public final class DockUnlockRevealTest {
         retainsPoseDebtAcrossRepeatedLostFrames();
         clearsPoseDebtOnlyAfterTerminalCommit();
         cancelledRevealStillNeedsRestingCommit();
+        liftSettlesOnceWithoutMaterialPulsing();
+        lateLayerJoinsLandingAfterSkippedFrames();
         System.out.println("DockUnlockReveal tests passed");
     }
 
@@ -64,17 +66,21 @@ public final class DockUnlockRevealTest {
         DockUnlockReveal hidden = new DockUnlockReveal();
         hidden.arm(30000);
         hidden.startIfArmed(30000);
-        check(hidden.needsFrame(30820), "hidden active reveal still has a deadline");
-        check(!hidden.needsFrame(30821), "hidden reveal expires exactly at its duration");
+        check(hidden.needsFrame(30000 + DockUnlockReveal.TOTAL_MS - 1),
+                "hidden active reveal still has a deadline");
+        check(!hidden.needsFrame(30000 + DockUnlockReveal.TOTAL_MS),
+                "hidden reveal expires exactly at its duration");
         check(!hidden.isRunning(), "no progress sampling is needed to clear running state");
-        check(!hidden.arm(31220), "completed hidden reveal still observes duplicate-event guard");
-        check(hidden.arm(31221), "hidden completion cannot block the next real unlock");
+        check(!hidden.arm(30000 + DockUnlockReveal.TOTAL_MS + 400 - 1),
+                "completed hidden reveal still observes duplicate-event guard");
+        check(hidden.arm(30000 + DockUnlockReveal.TOTAL_MS + 400),
+                "hidden completion cannot block the next real unlock");
 
         DockUnlockReveal unsampled = new DockUnlockReveal();
         unsampled.arm(40000);
         unsampled.startIfArmed(40000);
-        check(unsampled.arm(41221), "arm itself expires a previous reveal with no frame callbacks");
-        check(unsampled.startIfArmed(41221), "next unlock starts after missing every previous frame");
+        check(unsampled.arm(40000 + DockUnlockReveal.TOTAL_MS + 400), "arm itself expires a previous reveal with no frame callbacks");
+        check(unsampled.startIfArmed(40000 + DockUnlockReveal.TOTAL_MS + 400), "next unlock starts after missing every previous frame");
         check(unsampled.alpha(41221) == 0f, "next unlock gets its own transparent first pose");
     }
 
@@ -105,16 +111,18 @@ public final class DockUnlockRevealTest {
         check(!DockUnlockReveal.acceptsNewEvent(-1, -1), "negative event time is invalid");
         check(!DockUnlockReveal.acceptsNewEvent(10000, 9999), "event cannot precede its predecessor");
         check(!DockUnlockReveal.acceptsNewEvent(10000, 10000), "same-time duplicate is rejected");
-        check(!DockUnlockReveal.acceptsNewEvent(10000, 11220), "duplicate-event window is exclusive");
-        check(DockUnlockReveal.acceptsNewEvent(10000, 11221), "next event starts at the guard boundary");
-        check(DockUnlockReveal.acceptsPending(10000, 11221),
+        check(!DockUnlockReveal.acceptsNewEvent(10000, 10000 + DockUnlockReveal.TOTAL_MS + 400 - 1),
+                "duplicate-event window is exclusive");
+        check(DockUnlockReveal.acceptsNewEvent(10000, 10000 + DockUnlockReveal.TOTAL_MS + 400),
+                "next event starts at the guard boundary");
+        check(DockUnlockReveal.acceptsPending(10000, 10000 + DockUnlockReveal.TOTAL_MS + 400),
                 "an old pending event can coexist with an accepted next event");
 
         DockUnlockReveal existingLayer = new DockUnlockReveal();
         existingLayer.arm(10000);
         existingLayer.startIfArmed(10000);
         long pendingAt = 10000;
-        long nextEvent = 11221;
+        long nextEvent = 10000 + DockUnlockReveal.TOTAL_MS + 400;
         if (DockUnlockReveal.acceptsNewEvent(pendingAt, nextEvent)) pendingAt = nextEvent;
         check(pendingAt == nextEvent, "accepted event replaces the still-recent pending epoch");
         check(existingLayer.arm(nextEvent), "existing layer accepts the same next-event boundary");
@@ -133,10 +141,10 @@ public final class DockUnlockRevealTest {
         check(reveal.arm(0), "uptime zero is a valid first event");
         check(reveal.startIfArmed(0), "uptime-zero event starts normally");
         check(reveal.alpha(0) == 0f, "uptime-zero event begins transparent");
-        check(!reveal.needsFrame(821), "uptime-zero event expires at the normal duration");
-        check(!reveal.arm(821), "uptime-zero history must not be confused with an absent event");
-        check(!reveal.arm(1220), "uptime-zero event keeps the full duplicate guard");
-        check(reveal.arm(1221), "uptime-zero event permits the next unlock at the same boundary");
+        check(!reveal.needsFrame(DockUnlockReveal.TOTAL_MS), "uptime-zero event expires at the normal duration");
+        check(!reveal.arm(DockUnlockReveal.TOTAL_MS), "uptime-zero history must not be confused with an absent event");
+        check(!reveal.arm(DockUnlockReveal.TOTAL_MS + 400 - 1), "uptime-zero event keeps the full duplicate guard");
+        check(reveal.arm(DockUnlockReveal.TOTAL_MS + 400), "uptime-zero event permits the next unlock at the same boundary");
     }
 
     private static void retainsPoseDebtAcrossRepeatedLostFrames() {
@@ -146,7 +154,7 @@ public final class DockUnlockRevealTest {
         reveal.startIfArmed(10000);
         check(reveal.alpha(10700) == 1f && reveal.scale(10700) == 1f,
                 "late reveal can already have resting opacity and scale");
-        check(reveal.risePx(3f, 10700) > 0f,
+        check(Math.abs(reveal.risePx(3f, 10700)) > 0f,
                 "resting opacity and scale do not imply a resting position");
         reveal.onPoseCommitted(10700);
         check(reveal.hasPendingPose(), "committing an intermediate rise still owes its terminal pose");
@@ -169,21 +177,22 @@ public final class DockUnlockRevealTest {
         reveal.onPoseCommitted(20000);
         check(reveal.hasPendingPose(), "priming an armed hidden pose is not a terminal submission");
         reveal.startIfArmed(20000);
-        reveal.onPoseCommitted(20820);
+        reveal.onPoseCommitted(20000 + DockUnlockReveal.TOTAL_MS - 1);
         check(reveal.hasPendingPose(), "submission before the duration boundary cannot clear debt");
-        reveal.onPoseCommitted(20821);
+        reveal.onPoseCommitted(20000 + DockUnlockReveal.TOTAL_MS);
         check(!reveal.hasPendingPose(), "terminal commit clears debt even without progress sampling");
 
-        check(reveal.arm(21221), "a later unlock can start after the previous terminal commit");
+        check(reveal.arm(20000 + DockUnlockReveal.TOTAL_MS + 400), "a later unlock can start after the previous terminal commit");
         check(reveal.hasPendingPose(), "every accepted unlock creates a fresh pose debt");
-        check(!reveal.arm(21222), "duplicate callback still cannot restart the fresh unlock");
+        check(!reveal.arm(20000 + DockUnlockReveal.TOTAL_MS + 401), "duplicate callback still cannot restart the fresh unlock");
         check(reveal.hasPendingPose(), "duplicate callback cannot acknowledge the fresh pose debt");
-        reveal.startIfArmed(21221);
-        reveal.onPoseCommitted(21222);
+        reveal.startIfArmed(20000 + DockUnlockReveal.TOTAL_MS + 400);
+        reveal.onPoseCommitted(20000 + DockUnlockReveal.TOTAL_MS + 401);
         check(reveal.hasPendingPose(), "an early second-unlock commit cannot clear its debt");
-        reveal.progress(22042);
+        long secondTerminal = 20000 + (DockUnlockReveal.TOTAL_MS + 400) + DockUnlockReveal.TOTAL_MS;
+        reveal.progress(secondTerminal);
         check(reveal.hasPendingPose(), "progress expiry alone cannot acknowledge a second terminal pose");
-        reveal.onPoseCommitted(22042);
+        reveal.onPoseCommitted(secondTerminal);
         check(!reveal.hasPendingPose(), "second terminal commit clears only the current debt");
     }
 
@@ -206,5 +215,71 @@ public final class DockUnlockRevealTest {
         check(expired.hasPendingPose(), "armed timeout retains the need to clear its primed pose");
         expired.onPoseCommitted(41501);
         check(!expired.hasPendingPose(), "resting submission also acknowledges armed timeout");
+    }
+
+    private static void liftSettlesOnceWithoutMaterialPulsing() {
+        DockUnlockReveal reveal = new DockUnlockReveal();
+        reveal.arm(10000);
+        reveal.startIfArmed(10000);
+        check(reveal.alpha(10000) == 0f, "the first pose stays transparent");
+        float previousY = reveal.risePx(1f, 10000);
+        float previousAlpha = 0f;
+        float minimumY = previousY;
+        boolean landing = false;
+        for (long elapsed = 1; elapsed <= DockUnlockReveal.TOTAL_MS; elapsed++) {
+            long now = 10000 + elapsed;
+            float y = reveal.risePx(1f, now);
+            float alpha = reveal.alpha(now);
+            check(Float.isFinite(y) && y >= -6f && y <= 96f,
+                    "lift and overshoot remain bounded near the icon row");
+            check(alpha >= previousAlpha && alpha <= 1f,
+                    "the material only fades in, never pulses during the landing");
+            check(reveal.scale(now) == 1f, "glass is never resampled by reveal scaling");
+            if (y > previousY) landing = true;
+            if (landing) check(y >= previousY, "only one landing, with no repeated bounces");
+            minimumY = Math.min(minimumY, y);
+            previousY = y;
+            previousAlpha = alpha;
+        }
+        check(landing && minimumY < -4.5f, "the lift has a visible but restrained overshoot");
+        check(previousY == 0f && previousAlpha == 1f, "the deadline ends at the exact resting pose");
+
+        DockUnlockReveal lead = new DockUnlockReveal();
+        lead.arm(40000);
+        lead.startIfArmed(40000);
+        float startPose = lead.risePx(1f, 40000);
+        check(startPose == DockUnlockReveal.RISE_DP, "the lead keeps the dock at its start offset");
+        check(lead.risePx(1f, 40009) == startPose && lead.alpha(40009) == 0f,
+                "the icons' measured head start is held, not skipped");
+        check(lead.risePx(1f, 40011) < startPose,
+                "motion begins exactly when the launcher's icon fly-in begins");
+        check(lead.risePx(1f, 40000 + DockUnlockReveal.TOTAL_MS) == 0f,
+                "the lead does not shorten or lengthen the fly-in itself");
+
+        DockUnlockReveal fading = new DockUnlockReveal();
+        fading.arm(20000);
+        fading.startIfArmed(20000);
+        check(fading.alpha(20100) > 0.4f && fading.alpha(20100) < 0.6f,
+                "opacity builds visibly during the early lift");
+        check(fading.alpha(20190) == 1f, "the glass is opaque before the landing begins");
+        check(fading.alpha(20191) == 1f, "fade completion does not produce an opacity step");
+    }
+
+    private static void lateLayerJoinsLandingAfterSkippedFrames() {
+        DockUnlockReveal smooth = new DockUnlockReveal();
+        smooth.arm(30000);
+        smooth.startIfArmed(30000);
+        for (long elapsed = 0; elapsed < 530; elapsed += 8) {
+            smooth.risePx(3f, 30000 + elapsed);
+            smooth.alpha(30000 + elapsed);
+        }
+        DockUnlockReveal late = new DockUnlockReveal();
+        late.arm(30000);
+        late.startIfArmed(30530);
+        check(late.risePx(3f, 30530) == smooth.risePx(3f, 30530),
+                "a recreated surface joins the landing even after skipping the whole lift");
+        check(late.alpha(30530) == smooth.alpha(30530), "late material keeps the same opacity");
+        check(late.risePx(Float.NaN, 30530) == 0f && late.risePx(0f, 30530) == 0f,
+                "invalid density cannot put a non-finite position into a surface transaction");
     }
 }

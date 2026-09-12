@@ -102,10 +102,27 @@ survives repeated lost callbacks and is cleared only after submitting the restin
 The tests also cover rise-only residue after opacity reaches one, cancelled reveals,
 and retrying the terminal frame without falsely acknowledging an unsubmitted pose.
 
-After loading the new system hook, verify `phase=going-away pose=single-clock-v2`.
+The `lift-settle-v3` reveal rises from 96dp below the Dock, overshoots by about
+5.5dp once, and lands with zero velocity within the same 821ms window. It holds
+the start pose for a measured 10ms icon lead, because the launcher's own
+`_showPresent` follows the keyguard epoch by 9-10ms, so the background starts on
+the same phase as the dock icons. Opacity uses an independent 180ms smoothstep
+fade so the return cannot pulse the glass.
+The parent stays at scale 1; material presets and render surfaces are unchanged.
+Tests bound the full trajectory, opacity, number of reversals, exact resting
+endpoint, and a late-created surface joining the landing after skipped frames.
+
+After loading the new system hook, verify
+`phase=going-away pose=single-clock-v2 style=lift-settle-v3`.
+Each transition-start also records `riseDp=96.0 style=lift-settle-v3`, so a
+missed initialization log does not hide which curve is running. On the September 12
+trace, native icon starts followed the keyguard epoch by 9–10ms and lasted about
+0.8s. Verify the launcher's `_showPresent` actually occurs: a stuck
+`isWorkspaceLoading=true` state can suppress icon fly-in while the background's
+keyguard-triggered animation still runs.
 Test fingerprint unlock from doze and unlock from the lit lock screen, including
 repeated unlocks and a launcher-surface recreation. Record whether the Dock flashes at
-rest before moving or moves backward mid-flight. Host tests and an APK install alone
+rest before moving or abruptly jumps during the intended gentle landing. Host tests and an APK install alone
 do not prove these visual results. The 821ms rise/fade remains a local approximation,
 not per-frame sampling of Flutter's staggered 3D unlock animation.
 

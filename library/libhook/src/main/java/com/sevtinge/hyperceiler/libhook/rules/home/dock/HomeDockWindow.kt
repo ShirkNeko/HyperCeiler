@@ -813,7 +813,7 @@ class HomeDockWindow : BaseHook() {
             if (hooked) {
                 glassClient.record(
                     "unlock reveal trigger ready ${method.toGenericString()} " +
-                        "phase=going-away pose=single-clock-v2")
+                        "phase=going-away pose=single-clock-v2 style=lift-settle-v3")
                 return
             }
             glassClient.record("unlock reveal hook failed $className#$methodName")
@@ -858,7 +858,8 @@ class HomeDockWindow : BaseHook() {
                 }
             }
             // Even with no existing layer, retain the event for obtainLayer and run the safety net.
-            glassClient.record("unlock reveal transition-start layers=$armed uptimeMs=$pendingRevealAt durationMs=${DockUnlockReveal.DURATION_MS}")
+            glassClient.record("unlock reveal transition-start layers=$armed uptimeMs=$pendingRevealAt " +
+                "durationMs=${DockUnlockReveal.DURATION_MS} riseDp=${DockUnlockReveal.RISE_DP} style=lift-settle-v3")
             // Pose the layers now, so the frame where the dock first becomes visible is already
             // the animation's first frame instead of one flash at the resting size.
             if (directMotionAvailable) scheduleAnimationFrame(true) else {

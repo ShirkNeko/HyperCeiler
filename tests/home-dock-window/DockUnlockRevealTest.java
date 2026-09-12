@@ -18,6 +18,8 @@ public final class DockUnlockRevealTest {
         clearsPoseDebtOnlyAfterTerminalCommit();
         cancelledRevealStillNeedsRestingCommit();
         liftSettlesOnceWithoutMaterialPulsing();
+        tiltIsARealPerspectiveSweep();
+        stylesFollowTheirReferenceCurves();
         lateLayerJoinsLandingAfterSkippedFrames();
         System.out.println("DockUnlockReveal tests passed");
     }
@@ -263,6 +265,161 @@ public final class DockUnlockRevealTest {
                 "opacity builds visibly during the early lift");
         check(fading.alpha(20190) == 1f, "the glass is opaque before the landing begins");
         check(fading.alpha(20191) == 1f, "fade completion does not produce an opacity step");
+    }
+
+    private static void tiltIsARealPerspectiveSweep() {
+        long start = 50000;
+        DockUnlockReveal.Pose3D first = DockUnlockReveal.pose3D(DockUnlockReveal.Style.DEPTH_FLIP, start, start);
+        check(Math.abs(first.rotationX - DockUnlockReveal.POSE_ROT_X_DEG) < 0.001f
+                        && Math.abs(first.rotationY - DockUnlockReveal.POSE_ROT_Y_DEG) < 0.001f
+                        && Math.abs(first.scale - DockUnlockReveal.POSE_SCALE) < 0.001f
+                        && first.active,
+                "the lead holds the full depth-flip start pose");
+        float maxRotationX = first.rotationX;
+        float minimumRotationX = first.rotationX;
+        float previousFraction = Float.MAX_VALUE;
+        boolean dippedPastFlat = false;
+        for (long elapsed = 1; elapsed < DockUnlockReveal.TOTAL_MS; elapsed++) {
+            DockUnlockReveal.Pose3D pose = DockUnlockReveal.pose3D(DockUnlockReveal.Style.DEPTH_FLIP, start, start + elapsed);
+            check(Float.isFinite(pose.rotationX) && Float.isFinite(pose.rotationY)
+                            && Float.isFinite(pose.rotationZ) && Float.isFinite(pose.scale),
+                    "no NaN or infinity may enter a surface transaction");
+            check(pose.scale >= DockUnlockReveal.POSE_SCALE && pose.scale <= 1f,
+                    "depth scale only grows towards identity");
+            check(Math.abs(pose.rotationX) <= DockUnlockReveal.POSE_ROT_X_DEG,
+                    "rotation stays within the start angle");
+            maxRotationX = Math.max(maxRotationX, pose.rotationX);
+            minimumRotationX = Math.min(minimumRotationX, pose.rotationX);
+            if (pose.rotationX < 0f) dippedPastFlat = true;
+            check(pose.active, "the pose stays active for the whole window");
+        }
+        check(minimumRotationX < 0f, "the flip overshoots past flat exactly once, like a card settling");
+        check(maxRotationX == DockUnlockReveal.POSE_ROT_X_DEG,
+                "no frame exceeds the start angle on the way down");
+        check(dippedPastFlat, "the elegant overshoot is actually present");
+        DockUnlockReveal.Pose3D end = DockUnlockReveal.pose3D(DockUnlockReveal.Style.DEPTH_FLIP, start, start + DockUnlockReveal.TOTAL_MS);
+        check(!end.active && end.rotationX == 0f && end.rotationY == 0f
+                        && end.rotationZ == 0f && end.scale == 1f,
+                "the reveal ends exactly at the resting identity pose");
+        DockUnlockReveal.Pose3D late = DockUnlockReveal.pose3D(DockUnlockReveal.Style.DEPTH_FLIP, start, start + DockUnlockReveal.TOTAL_MS + 9000);
+        check(!late.active && late.scale == 1f, "a late query reports resting, not a stale pose");
+        DockUnlockReveal.Pose3D early = DockUnlockReveal.pose3D(DockUnlockReveal.Style.DEPTH_FLIP, start, start - 1000);
+        check(early.active && early.rotationX == DockUnlockReveal.POSE_ROT_X_DEG,
+                "a query from before the epoch holds the start pose, never a negative tilt");
+    }
+
+    private static void stylesFollowTheirReferenceCurves() {
+        long start = 60000;
+        float width = 900f;
+
+        // Orbital sweep: a shallow arc. The lateral axis leads the vertical one (which is what
+        // turns two springs into a curve), and one underdamped spring snaps both onto rest.
+        DockUnlockReveal orbit = new DockUnlockReveal();
+        orbit.setStyle(DockUnlockReveal.Style.ORBIT_SWEEP);
+        orbit.arm(start);
+        orbit.startIfArmed(start);
+        check(orbit.risePx(1f, start) == 44f, "the sweep starts 44dp below the resting line");
+        check(orbit.slidePx(width, start) == -72f, "the sweep starts 8% of the width to the left");
+        float lead = -1f;
+        int overshoots = 0;
+        float previousRise = orbit.risePx(1f, start);
+        boolean crossed = false;
+        for (long elapsed = 1; elapsed < DockUnlockReveal.TOTAL_MS; elapsed++) {
+            float rise = orbit.risePx(1f, start + elapsed);
+            check(Float.isFinite(rise) && rise <= 44.5f,
+                    "the sweep never rises above its start offset");
+            // The path bends only while the lateral spring stays ahead of the vertical one.
+            // Comparing the two signed spring progress values keeps the check valid through the
+            // overshoot, where a magnitude-based "progress" would wrap around.
+            float lateralProgress = 1f + orbit.slidePx(width, start + elapsed) / 72f;
+            float verticalProgress = 1f - rise / 44f;
+            // The bend is formed while both axes approach: the lateral spring is tuned faster,
+            // so it stays ahead for the first half and lets the path curve instead of running
+            // straight. Past the midpoint the vertical overshoot is the larger one, which is the
+            // settle the eye reads as the snap.
+            lead = Math.max(lead, lateralProgress - verticalProgress);
+            if (rise < 0f && !crossed) { crossed = true; overshoots++; }
+            if (rise > previousRise && crossed) crossed = false;
+            previousRise = rise;
+        }
+        check(lead > 0.10f, "the lateral axis leads far enough for the path to read as an arc");
+        check(Math.abs(orbit.risePx(1f, start + DockUnlockReveal.TOTAL_MS - 1)) < 0.3f,
+                "the vertical spring has effectively settled by the end of the window");
+        check(Math.abs(orbit.slidePx(width, start + DockUnlockReveal.TOTAL_MS - 1)) < 0.3f,
+                "the lateral spring has effectively settled by the end of the window");
+        check(crossed || overshoots > 0, "exactly one clean spring overshoot is present");
+        check(orbit.risePx(1f, start + DockUnlockReveal.TOTAL_MS) == 0f, "the sweep ends exactly at rest");
+        check(orbit.slidePx(width, start + DockUnlockReveal.TOTAL_MS) == 0f, "the sweep ends exactly on x");
+        // A single crossing: the spring may pass the resting line once and must not ring.
+        int crossings = 0;
+        float last = orbit.risePx(1f, start);
+        for (long elapsed = 1; elapsed < DockUnlockReveal.TOTAL_MS; elapsed++) {
+            float rise = orbit.risePx(1f, start + elapsed);
+            if ((last > 0f && rise <= 0f) || (last < 0f && rise >= 0f)) crossings++;
+            last = rise;
+        }
+        check(crossings <= 2, "the spring settles cleanly instead of ringing");
+        DockUnlockReveal.Pose3D orbitStart = DockUnlockReveal.pose3D(DockUnlockReveal.Style.ORBIT_SWEEP, start, start);
+        check(Math.abs(orbitStart.scale - 0.86f) < 0.001f && Math.abs(orbitStart.rotationZ + 3.2f) < 0.001f,
+                "the sweep starts slightly small and slightly turned");
+        boolean scaleOvershoot = false;
+        for (long elapsed = 1; elapsed < DockUnlockReveal.TOTAL_MS; elapsed++) {
+            DockUnlockReveal.Pose3D pose = DockUnlockReveal.pose3D(
+                    DockUnlockReveal.Style.ORBIT_SWEEP, start, start + elapsed);
+            if (pose.scale > 1f) scaleOvershoot = true;
+            check(pose.scale <= 1.02f, "the scale overshoot stays invisible at the layer bounds");
+        }
+        check(scaleOvershoot, "the scale overshoots slightly before settling, as a spring must");
+
+        // Gale: Material shared axis X - lateral slide plus fade, no vertical travel, no rotation.
+        DockUnlockReveal gale = new DockUnlockReveal();
+        gale.setStyle(DockUnlockReveal.Style.GALE);
+        gale.arm(start);
+        gale.startIfArmed(start);
+        check(gale.risePx(1f, start + 300) == 0f, "gale never moves the layer vertically");
+        float slideStart = gale.slidePx(width, start);
+        check(slideStart < -300f && slideStart > -310f, "gale starts 34% of the width to the left");
+        float previousSlide = slideStart;
+        for (long elapsed = 1; elapsed < DockUnlockReveal.TOTAL_MS; elapsed++) {
+            float slide = gale.slidePx(width, start + elapsed);
+            check(slide >= previousSlide, "the slide only ever closes towards the resting x");
+            previousSlide = slide;
+        }
+        check(gale.slidePx(width, start + DockUnlockReveal.TOTAL_MS) == 0f, "gale lands exactly on x");
+        check(!DockUnlockReveal.pose3D(DockUnlockReveal.Style.GALE, start, start + 200).active,
+                "gale carries no view transform: the slide is the whole gesture");
+        check(gale.slidePx(0f, start) == 0f && gale.slidePx(Float.NaN, start) == 0f,
+                "an invalid width cannot put a non-finite offset into a transaction");
+        check(orbit.slidePx(0f, start) == 0f, "the sweep rejects an invalid width too");
+
+        // Ripple: a visibly larger gather into place. Starting below 1 is deliberate - a child
+        // surface clips anything above its own bounds, so an "arrive from larger" version would
+        // simply not be visible.
+        DockUnlockReveal ripple = new DockUnlockReveal();
+        ripple.setStyle(DockUnlockReveal.Style.RIPPLE);
+        ripple.arm(start);
+        ripple.startIfArmed(start);
+        DockUnlockReveal.Pose3D rippleStart = DockUnlockReveal.pose3D(DockUnlockReveal.Style.RIPPLE, start, start);
+        check(Math.abs(rippleStart.scale - 0.84f) < 0.001f,
+                "ripple starts far enough below 1 to be clearly visible");
+        float previousScale = rippleStart.scale;
+        for (long elapsed = 1; elapsed < DockUnlockReveal.TOTAL_MS; elapsed++) {
+            DockUnlockReveal.Pose3D pose = DockUnlockReveal.pose3D(DockUnlockReveal.Style.RIPPLE, start, start + elapsed);
+            check(pose.scale >= previousScale && pose.scale <= 1f,
+                    "the gather grows monotonically and never overshoots past 1");
+            check(pose.rotationX == 0f && pose.rotationY == 0f && pose.rotationZ == 0f,
+                    "the gather has no sway: scale and fade are the whole gesture");
+            previousScale = pose.scale;
+        }
+        check(ripple.risePx(1f, start + 100) == 0f, "ripple never moves the layer");
+        check(ripple.alpha(start + 90) > 0.4f && ripple.alpha(start + 90) < 0.6f,
+                "ripple keeps the shared early fade, which also hides the gather's edge halo");
+        check(!DockUnlockReveal.pose3D(DockUnlockReveal.Style.DAYBREAK, start, start + 300).active,
+                "daybreak carries no view transform either");
+
+        // Depth flip is the only style with a view-side 3D projection.
+        DockUnlockReveal.Pose3D flip = DockUnlockReveal.pose3D(DockUnlockReveal.Style.DEPTH_FLIP, start, start + 300);
+        check(flip.active && Math.abs(flip.rotationX) > 1f, "depth flip is mid-sweep at the same instant");
     }
 
     private static void lateLayerJoinsLandingAfterSkippedFrames() {

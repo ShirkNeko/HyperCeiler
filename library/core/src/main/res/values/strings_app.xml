@@ -1380,6 +1380,12 @@
     <string name="home_widget_resizable">Remove any widget size limitations</string>
     <string name="home_widget_widget_blur_opt">Optimize widget blur</string>
     <string name="home_dock">Dock</string>
+    <string name="home_dock_unlock_style">Dock unlock fly-in animation</string>
+    <string name="home_dock_unlock_style_daybreak">Rise and settle</string>
+    <string name="home_dock_unlock_style_depth_flip">Arrive from depth</string>
+    <string name="home_dock_unlock_style_gale">Swing in from the side</string>
+    <string name="home_dock_unlock_style_orbit_sweep">Orbital sweep</string>
+    <string name="home_dock_unlock_style_ripple">Contract and calm</string>
     <string name="home_dock_bg_enable">Add background blur to dock</string>
     <string name="home_dock_bg_all_app">Drawer mode compatible</string>
     <string name="home_dock_bg_all_app_more">Turning on prevents the dock from being truncated, but the dock height is limited.</string>

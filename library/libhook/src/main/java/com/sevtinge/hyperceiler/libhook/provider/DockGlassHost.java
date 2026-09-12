@@ -33,7 +33,9 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.Process;
+import android.os.SystemClock;
 import android.util.Log;
+import android.view.Choreographer;
 import android.view.Display;
 import android.view.SurfaceControlViewHost;
 import android.view.View;
@@ -42,6 +44,7 @@ import android.view.WindowManager;
 import android.widget.FrameLayout;
 
 import com.sevtinge.hyperceiler.libhook.rules.home.dock.DockGlassPreset;
+import com.sevtinge.hyperceiler.libhook.rules.home.dock.DockUnlockReveal;
 
 import org.lsposed.hiddenapibypass.HiddenApiBypass;
 
@@ -66,6 +69,9 @@ final class DockGlassHost {
     private volatile int appliedBrightnessBit = -1;
     private String lastDockStatus = "no Dock request in this app process";
     private String lastDockRelease = "none";
+    // Main-thread only. The Choreographer belongs to this process, never to system_server.
+    private Choreographer revealChoreographer;
+    private final Choreographer.FrameCallback revealFrame = this::onRevealFrame;
 
     private static final class Entry {
         final SurfaceControlViewHost host;
@@ -77,6 +83,11 @@ final class DockGlassHost {
         // the wallpaper brightness now); it is kept for diagnostics and the fallback tint.
         final boolean dark;
         final int radiusPx;
+        // Absolute unlock epoch from system_server; -1 when no reveal is in flight.
+        long revealStartedAt = -1L;
+        boolean revealActive;
+        DockUnlockReveal.Style revealStyle = DockUnlockReveal.Style.DAYBREAK;
+        int height;
         SurfaceControlViewHost.SurfacePackage parcel;
         Entry(SurfaceControlViewHost host, View view, View backdrop, IBinder owner,
               IBinder.DeathRecipient death, boolean dark, int radiusPx) {
@@ -148,6 +159,7 @@ final class DockGlassHost {
                 case "dock_glass_probe" -> result.complete(probe(id));
                 case "dock_glass_refresh" -> result.complete(refresh(id));
                 case "dock_glass_release" -> { release(id); result.complete(Bundle.EMPTY); }
+                case "dock_glass_unlock" -> { startReveal(id, args); result.complete(Bundle.EMPTY); }
                 default -> throw new IllegalArgumentException("Unknown glass operation");
             }
         } catch (Throwable error) {
@@ -210,6 +222,7 @@ final class DockGlassHost {
         IBinder.DeathRecipient death = () -> main.post(() -> release(id));
         boolean dark = args.getBoolean("dark");
         Entry entry = new Entry(host, view, backdrop, owner, death, dark, (int) radius);
+        entry.height = height;
         entries.put(id, entry);
         owner.linkToDeath(death, 0);
         WindowManager.LayoutParams layout = new WindowManager.LayoutParams(width, height,
@@ -259,6 +272,74 @@ final class DockGlassHost {
             result.completeExceptionally(error);
             Log.w(TAG, "Native glass configuration failed", error);
         }
+    }
+
+    /**
+     * Start the 3D part of the unlock reveal for one host.
+     *
+     * <p>The projection runs here, in the module's own process, against this process's
+     * Choreographer: a child SurfaceControl can only carry an affine matrix, so the
+     * perspective has to be applied to the glass View that we own. Only the absolute
+     * start time comes from system_server, so the two sides cannot drift, and a failure
+     * here can never take system_server with it.
+     */
+    private void startReveal(String id, Bundle args) {
+        Entry entry = entries.get(id);
+        if (entry == null || args == null) return;
+        long startedAt = args.getLong("startedAtMs");
+        if (startedAt <= 0L) return;
+        entry.revealStartedAt = startedAt;
+        entry.revealStyle = DockUnlockReveal.Style.of(args.getString("style"));
+        applyRevealPose(entry, SystemClock.uptimeMillis());
+        if (entry.revealActive) choreographer().postFrameCallback(revealFrame);
+        record(id, "unlock reveal 3d style="
+                + entry.revealStyle.name().toLowerCase(java.util.Locale.ROOT)
+                + " startedAtMs=" + startedAt);
+    }
+
+    private void onRevealFrame(long frameTimeNanos) {
+        long now = SystemClock.uptimeMillis();
+        boolean again = false;
+        for (Entry entry : entries.values()) {
+            if (!entry.revealActive) continue;
+            applyRevealPose(entry, now);
+            if (entry.revealActive) again = true;
+        }
+        if (again) choreographer().postFrameCallback(revealFrame);
+    }
+
+    private void applyRevealPose(Entry entry, long now) {
+        DockUnlockReveal.Pose3D pose = DockUnlockReveal.pose3D(entry.revealStyle, entry.revealStartedAt, now);
+        View view = entry.view;
+        if (pose.active) {
+            // A finite camera distance is what turns the rotation into a perspective:
+            // the near edge grows and the far edge shrinks, like the icon row's depth step.
+            view.setCameraDistance(entry.height > 0 ? entry.height * DockUnlockReveal.CAMERA_HEIGHTS
+                    : view.getResources().getDisplayMetrics().density * 1280f);
+            view.setRotationX(pose.rotationX);
+            view.setRotationY(pose.rotationY);
+            view.setRotation(pose.rotationZ);
+            view.setScaleX(pose.scale);
+            view.setScaleY(pose.scale);
+        } else {
+            view.setRotationX(0f);
+            view.setRotationY(0f);
+            view.setRotation(0f);
+            view.setScaleX(1f);
+            view.setScaleY(1f);
+            view.setCameraDistance(view.getResources().getDisplayMetrics().density * 1280f);
+        }
+        entry.revealActive = pose.active;
+    }
+
+    private void stopReveal(Entry entry) {
+        entry.revealActive = false;
+        entry.revealStartedAt = -1L;
+    }
+
+    private Choreographer choreographer() {
+        if (revealChoreographer == null) revealChoreographer = Choreographer.getInstance();
+        return revealChoreographer;
     }
 
     private void commitFrame(String id, Entry entry, CompletableFuture<Bundle> result) {
@@ -510,6 +591,9 @@ final class DockGlassHost {
     private void release(String id) {
         Entry entry = entries.remove(id);
         if (entry == null) return;
+        // A host torn down mid-reveal must not keep its tilt: the frame loop stops as soon
+        // as no entry is active, and a recreated host starts from a flat view.
+        stopReveal(entry);
         if (!id.startsWith("self-test-")) lastDockRelease = id;
         try { entry.owner.unlinkToDeath(entry.death, 0); } catch (RuntimeException ignored) {}
         try { invoke(entry.backdrop, "setPassWindowBlurEnabled", false); }

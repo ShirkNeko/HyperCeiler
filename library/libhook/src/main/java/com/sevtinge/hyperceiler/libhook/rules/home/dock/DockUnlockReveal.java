@@ -39,6 +39,33 @@ package com.sevtinge.hyperceiler.libhook.rules.home.dock;
 public final class DockUnlockReveal {
     /** Measured on device: UnlockAnimGetxController._showPresent -> endAnimation. */
     public static final long DURATION_MS = 821L;
+
+    /**
+     * The five fly-in looks a user can pick in the Dock settings. They differ in which axis
+     * carries the motion and how the easing reads, so no two feel like variations of one idea:
+     * <ul>
+     *   <li>{@link #DAYBREAK} — a 96dp rise from below with one restrained settle.</li>
+     *   <li>{@link #DEPTH_FLIP} — the same rise plus a real perspective flip from depth.</li>
+     *   <li>{@link #GALE} — no vertical travel; the glass slides in from the side and fades.</li>
+     *   <li>{@link #ORBIT_SWEEP} — a fast arc: lateral offset leads, the rise follows, and a
+     *       single underdamped spring snaps everything onto the resting pose.</li>
+     *   <li>{@link #RIPPLE} — the glass arrives small and gathers into place, scale plus fade
+     *       only, with no sway and no overshoot.</li>
+     * </ul>
+     */
+    public enum Style {
+        DAYBREAK, DEPTH_FLIP, GALE, ORBIT_SWEEP, RIPPLE;
+
+        public static Style of(String name) {
+            if (name != null) {
+                for (Style style : values()) {
+                    if (style.name().equalsIgnoreCase(name)) return style;
+                }
+            }
+            return DAYBREAK;
+        }
+    }
+
     /**
      * How much later the launcher's own icon fly-in starts, measured on device.
      *
@@ -85,6 +112,16 @@ public final class DockUnlockReveal {
     private boolean pendingPose;
     private long armedAt;
     private long startedAt = -1L;
+    private volatile Style style = Style.DAYBREAK;
+
+    /** The look chosen in the Dock settings; read on every pose sample. */
+    public void setStyle(Style newStyle) {
+        this.style = newStyle == null ? Style.DAYBREAK : newStyle;
+    }
+
+    public Style getStyle() {
+        return style;
+    }
 
     /** A late-created surface may join this unlock, but not an old or future event. */
     public static boolean acceptsPending(long eventMillis, long nowMillis) {
@@ -216,10 +253,234 @@ public final class DockUnlockReveal {
     public float risePx(float density, long nowMillis) {
         if (!Float.isFinite(density) || density <= 0f) return 0f;
         float t = elapsedFraction(nowMillis);
+        if (style == Style.GALE || style == Style.RIPPLE) return 0f;
+        if (style == Style.ORBIT_SWEEP) {
+            return ORBIT_RISE_DP * density * (1f - spring(t, ORBIT_OMEGA_Y));
+        }
         float remaining = 1f - t;
         // Cross the resting position once, overshoot gently, then return with zero velocity.
         // A closed-form curve remains identical at 60/90/120Hz and after a missed frame.
         float lift = remaining * remaining * (1f - (LIFT_TENSION + 1f) * t);
         return RISE_DP * density * lift;
+    }
+
+    /**
+     * Horizontal offset; negative means "still to the left of rest".
+     *
+     * <p>Two very different looks share this axis. {@link Style#GALE} is Material's shared axis
+     * X: content enters from the side on a decelerating curve. {@link Style#ORBIT_SWEEP} uses the
+     * same axis as the leading half of an arc, which is why its spring settles earlier than the
+     * vertical one.
+     */
+    public float slidePx(float widthPx, long nowMillis) {
+        if (!Float.isFinite(widthPx) || widthPx <= 0f) return 0f;
+        float t = elapsedFraction(nowMillis);
+        if (style == Style.GALE) {
+            return -GALE_SLIDE_FRACTION * widthPx * (1f - emphasizedDecelerate(t));
+        }
+        if (style == Style.ORBIT_SWEEP) {
+            return -ORBIT_SLIDE_FRACTION * widthPx * (1f - spring(t, ORBIT_OMEGA_X));
+        }
+        return 0f;
+    }
+
+    /**
+     * Unit spring response of a mass released with velocity, used by the orbital sweep.
+     *
+     * <p>Closed form of the standard underdamped solution for {@code x(0)=0, x'(0)=v} with
+     * damping ratio {@code z} and natural frequency {@code w}, so every frame is derived from the
+     * absolute clock and a missed frame cannot change the result. It is a real spring rather than
+     * an ease-out-back: the single overshoot decays by the same physics that governs the settle.
+     */
+    private static float spring(float t, float w) {
+        // Normalised so the response is exactly 1 at the end of the window. A raw spring still
+        // holds a fraction of a percent of offset there, and the caller's contract is that the
+        // final pose is the resting pose, not something imperceptibly close to it.
+        return rawSpring(t, w) / rawSpring(1f, w);
+    }
+
+    private static float rawSpring(float t, float w) {
+        float wd = w * (float) Math.sqrt(1f - ORBIT_ZETA * ORBIT_ZETA);
+        float decay = (float) Math.exp(-ORBIT_ZETA * w * t);
+        // The coefficient carries (damping - entry velocity): with the opposite sign the solution
+        // would start by moving away from the target, which shows up as a visible wind-up.
+        float coefficient = (ORBIT_ZETA * w - ORBIT_ENTRY_VELOCITY) / wd;
+        return 1f - decay * ((float) Math.cos(wd * t) + coefficient * (float) Math.sin(wd * t));
+    }
+
+    /** Material 3 "emphasized decelerate": starts at peak velocity and comes to rest. */
+    private static float emphasizedDecelerate(float t) {
+        return cubicBezier(EMPHASIZED_DECELERATE, t);
+    }
+
+    /**
+     * Evaluate a CSS/Material cubic-bezier(x1, y1, x2, y2) easing.
+     *
+     * <p>Frames sample this by progress, so the curve has to be solvable for x rather than
+     * parametric in t: a short bisection is enough for a value that is then rounded to a
+     * device pixel, and it keeps the class free of framework types.
+     */
+    private static float cubicBezier(float[] points, float x) {
+        if (x <= 0f) return 0f;
+        if (x >= 1f) return 1f;
+        float low = 0f;
+        float high = 1f;
+        for (int i = 0; i < 24; i++) {
+            float mid = (low + high) * 0.5f;
+            if (bezierAxis(points[0], points[2], mid) < x) low = mid;
+            else high = mid;
+        }
+        return bezierAxis(points[1], points[3], (low + high) * 0.5f);
+    }
+
+    private static float bezierAxis(float control1, float control2, float t) {
+        float inverse = 1f - t;
+        return 3f * inverse * inverse * t * control1 + 3f * inverse * t * t * control2 + t * t * t;
+    }
+
+    /**
+     * Start pose of the 3D fly-in ("depth-flip"): the dock arrives from depth — laid back
+     * 58°, yawed 14°, rolled 3.5°, scaled to 62% — and settles flat. The projection happens
+     * inside our own glass view, where a real camera with a finite distance is available.
+     * The SurfaceControl that carries the surface only supports an affine matrix, so a
+     * perspective there is impossible.
+     */
+    public static final float POSE_ROT_X_DEG = 58f;
+    public static final float POSE_ROT_Y_DEG = -14f;
+    public static final float POSE_ROT_Z_DEG = 3.5f;
+    public static final float POSE_SCALE = 0.62f;
+    /** Perspective strength: camera distance as a multiple of the layer height. */
+    public static final float CAMERA_HEIGHTS = 2.4f;
+    /** How far the flip overshoots past flat, as a fraction of the start angle (~5%). */
+    private static final float FLIP_OVERSHOOT = 0.9f;
+    /**
+     * Lateral travel of the "shared axis X" look, as a fraction of the layer width.
+     *
+     * <p>Material's shared axis X slides incoming content in from the side while it fades in.
+     * Its nominal 30dp offset is specified for full-screen content, where 30dp reads as a
+     * short directional nudge; a dock panel is a small element, so the same perceived weight
+     * needs the distance expressed relative to the element itself.
+     */
+    private static final float GALE_SLIDE_FRACTION = 0.34f;
+    /**
+     * Start scale of the "gather" look. Deliberately below 1: a child surface can never draw
+     * larger than its own buffer, so a start scale above 1 would be clipped at the layer bounds
+     * and therefore invisible. Arriving small is also what Material's fade-through does (92%);
+     * the value here is exaggerated because a settle the user cannot see is not a style.
+     */
+    private static final float SETTLE_SCALE = 0.84f;
+    /** Material 3 "emphasized decelerate": begins at peak velocity, ends at rest. */
+    private static final float[] EMPHASIZED_DECELERATE = {0.05f, 0.7f, 0.1f, 1f};
+    /**
+     * "Orbital sweep" start pose: the panel sweeps in on a shallow arc, so it starts below the
+     * resting line and off to one side, slightly turned and further away.
+     *
+     * <p>Sized to the element rather than copied from an icon: a dock panel is far wider than an
+     * icon, so the same 12-24dp lateral offset would vanish. The lateral term is a fraction of
+     * the width (about 24dp on the reference dock) while the rise stays in dp, which keeps the
+     * arc readable without making the panel travel across the screen.
+     */
+    private static final float ORBIT_RISE_DP = 44f;
+    private static final float ORBIT_SLIDE_FRACTION = 0.08f;
+    private static final float ORBIT_ROT_DEG = -3.2f;
+    private static final float ORBIT_SCALE = 0.86f;
+    /** Damping ratio: underdamped enough for one clear overshoot, clean rather than wobbly. */
+    private static final float ORBIT_ZETA = 0.62f;
+    /** The lateral axis settles first, so the path bends instead of running straight. */
+    private static final float ORBIT_OMEGA_X = 12f;
+    /** The rise finishes a little later, which is what turns two curves into an arc. */
+    private static final float ORBIT_OMEGA_Y = 8.8f;
+    /** Entry velocity of the spring: the panel arrives already moving, then snaps onto rest. */
+    private static final float ORBIT_ENTRY_VELOCITY = 3.4f;
+
+    /** Immutable 3D pose sampled at one instant. {@code active=false} means resting. */
+    public static final class Pose3D {
+        public final float rotationX;
+        public final float rotationY;
+        public final float rotationZ;
+        public final float scale;
+        public final boolean active;
+
+        Pose3D(float rotationX, float rotationY, float rotationZ, float scale, boolean active) {
+            this.rotationX = rotationX;
+            this.rotationY = rotationY;
+            this.rotationZ = rotationZ;
+            this.scale = scale;
+            this.active = active;
+        }
+
+        public static Pose3D identity() {
+            return new Pose3D(0f, 0f, 0f, 1f, false);
+        }
+    }
+
+    /**
+     * Sample the 3D fly-in pose at one instant.
+     *
+     * <p>Shared by both processes: system_server owns the epoch, and the glass view that
+     * actually performs the projection lives in the module's own process, where it
+     * re-derives the same phase from {@code SystemClock.uptimeMillis}. Only an absolute
+     * clock crosses the boundary, so no per-frame IPC is needed and the two sides cannot
+     * drift. Only {@link Style#DEPTH_FLIP}, {@link Style#GALE} and {@link Style#RIPPLE}
+     * carry a view transform; the position-only looks report identity.
+     */
+    public static Pose3D pose3D(Style style, long startedAtMillis, long nowMillis) {
+        long elapsed = nowMillis - startedAtMillis - ICON_LEAD_MS;
+        if (elapsed <= 0L) {
+            return startPose(style);
+        }
+        if (elapsed >= DURATION_MS) return Pose3D.identity();
+        float t = elapsed / (float) DURATION_MS;
+        float inverse = 1f - t;
+        float quint = 1f - inverse * inverse * inverse * inverse * inverse;
+        float remain = 1f - quint;
+        switch (style) {
+            case DEPTH_FLIP: {
+                // The main flip uses an ease-out-back with a small overshoot past flat (one
+                // restrained bounce reads as confidence, not wobble); yaw, roll and scale
+                // ride a plain ease-out quint so only one axis shows the overshoot.
+                float c1 = FLIP_OVERSHOOT;
+                float c3 = c1 + 1f;
+                float back = 1f + c3 * (t - 1f) * (t - 1f) * (t - 1f) + c1 * (t - 1f) * (t - 1f);
+                return new Pose3D(POSE_ROT_X_DEG * (1f - back),
+                        POSE_ROT_Y_DEG * remain,
+                        POSE_ROT_Z_DEG * remain,
+                        POSE_SCALE + (1f - POSE_SCALE) * quint,
+                        true);
+            }
+            case RIPPLE:
+                // Material's shared axis Z scales incoming content on a decelerating curve. The
+                // start scale is below 1 because a child surface cannot draw outside its own
+                // buffer: anything above 1 is clipped and simply invisible. No sway - the scale
+                // and the fade are the whole gesture, which is what keeps it calm.
+                return new Pose3D(0f, 0f, 0f,
+                        SETTLE_SCALE + (1f - SETTLE_SCALE) * emphasizedDecelerate(t), true);
+            case ORBIT_SWEEP: {
+                // Same spring as the trajectory, so scale and rotation land with the arc instead
+                // of drifting in after it. The scale rides the vertical axis and therefore shows
+                // the one overshoot; the rotation uses the lateral axis that settles first.
+                float lift = spring(t, ORBIT_OMEGA_Y);
+                float lateral = spring(t, ORBIT_OMEGA_X);
+                return new Pose3D(0f, 0f, ORBIT_ROT_DEG * (1f - lateral),
+                        ORBIT_SCALE + (1f - ORBIT_SCALE) * lift, true);
+            }
+            default:
+                // Daybreak is position-only, and so is Gale: its motion is the horizontal slide
+                // served by slidePx(), not a rotation.
+                return Pose3D.identity();
+        }
+    }
+
+    private static Pose3D startPose(Style style) {
+        switch (style) {
+            case DEPTH_FLIP:
+                return new Pose3D(POSE_ROT_X_DEG, POSE_ROT_Y_DEG, POSE_ROT_Z_DEG, POSE_SCALE, true);
+            case RIPPLE:
+                return new Pose3D(0f, 0f, 0f, SETTLE_SCALE, true);
+            case ORBIT_SWEEP:
+                return new Pose3D(0f, 0f, ORBIT_ROT_DEG, ORBIT_SCALE, true);
+            default:
+                return Pose3D.identity();
+        }
     }
 }

@@ -769,6 +769,22 @@
         <item>2</item>
     </string-array>
 
+    <string-array name="home_dock_unlock_style">
+        <item>@string/home_dock_unlock_style_daybreak</item>
+        <item>@string/home_dock_unlock_style_depth_flip</item>
+        <item>@string/home_dock_unlock_style_gale</item>
+        <item>@string/home_dock_unlock_style_orbit_sweep</item>
+        <item>@string/home_dock_unlock_style_ripple</item>
+    </string-array>
+
+    <string-array name="home_dock_unlock_style_value">
+        <item>daybreak</item>
+        <item>depth_flip</item>
+        <item>gale</item>
+        <item>orbit_sweep</item>
+        <item>ripple</item>
+    </string-array>
+
     <string-array name="blur_switch_value_new">
         <item>0</item>
         <item>1</item>

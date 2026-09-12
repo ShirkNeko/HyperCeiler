@@ -87,8 +87,14 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
     private val worker by workerDelegate
     private companion object {
         val uri: Uri = Uri.parse("content://com.sevtinge.hyperceiler.provider.sharedprefs")
+
+        /** Two seconds is imperceptible when picking a style and cheap while the dock is up. */
+        const val STYLE_QUERY_INTERVAL_MS = 2_000L
     }
     @Volatile private var closed = false
+    @Volatile private var styleContext: Context? = null
+    @Volatile private var liveRevealStyle: String? = null
+    private var styleQueryAt = 0L
     private val journal = Journal { worker }
 
     private class Journal(private val worker: () -> Handler) {
@@ -142,8 +148,51 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
         }
     }
 
-    fun bindDiagnostics(context: Context) { if (!closed) journal.bind(context) }
+    fun bindDiagnostics(context: Context) {
+        styleContext = context
+        if (!closed) journal.bind(context)
+    }
+
     fun record(event: String) { if (!closed) journal.record(event) }
+
+    /** Latest reveal style name read from the module's own preferences, or null before the first read. */
+    fun liveRevealStyle(): String? = liveRevealStyle
+
+    /**
+     * Re-read the unlock fly-in style from the module provider.
+     *
+     * <p>The style is consumed in system_server, but LSPosed's remote preferences there are a
+     * snapshot pushed by the daemon: when that push is lost the value stays stale for the rest
+     * of the process lifetime, and neither a launcher restart nor anything else refreshes it.
+     * The provider reads the settings file the UI actually wrote, so querying it directly makes
+     * a style change take effect within a couple of seconds. Throttled because every launcher
+     * traversal would otherwise issue its own cross-process query.
+     */
+    fun refreshRevealStyle() {
+        val context = styleContext ?: return
+        if (closed) return
+        val now = SystemClock.uptimeMillis()
+        if (now - styleQueryAt < STYLE_QUERY_INTERVAL_MS) return
+        styleQueryAt = now
+        worker.post {
+            guard("style query") {
+                catchingRecoverable({
+                    context.contentResolver.query(
+                        Uri.parse("$uri/string/prefs_key_home_dock_unlock_style"),
+                        null, null, null, null
+                    )?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            val value = cursor.getString(0)
+                            if (liveRevealStyle != value) {
+                                liveRevealStyle = value
+                                record("reveal style queried=$value")
+                            }
+                        }
+                    }
+                })
+            }
+        }
+    }
 
     /**
      * Run one asynchronous DockGlass task behind a hard exception boundary.
@@ -384,6 +433,31 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
     }
 
     /** Cancel delayed refresh/readiness work while the launcher parent is hidden. */
+    /**
+     * Hand the unlock epoch to the glass view once per unlock.
+     *
+     * <p>The 3D projection runs in the module's own process against its own Choreographer,
+     * because the SurfaceControl carrying the glass only supports an affine matrix. One
+     * absolute timestamp crosses the boundary; everything else is derived locally, so no
+     * per-frame IPC is needed and a slow round trip cannot stall a frame.
+     */
+    fun notifyUnlock(ticket: Ticket, startedAtMs: Long, style: DockUnlockReveal.Style) {
+        if (closed || ticket.cancelled) return
+        worker.post {
+            guard("unlock reveal") {
+                catchingRecoverable({
+                    val args = Bundle().apply {
+                        putLong("startedAtMs", startedAtMs)
+                        putLong("durationMs", DockUnlockReveal.DURATION_MS)
+                        putLong("leadMs", DockUnlockReveal.ICON_LEAD_MS)
+                        putString("style", style.name)
+                    }
+                    ticket.request("dock_glass_unlock", args)
+                })
+            }
+        }
+    }
+
     fun pauseRefresh(ticket: Ticket) {
         ticket.gate.pauseRefresh()
         worker.post { guard("pause refresh") { ticket.gate.invalidateReadiness() } }

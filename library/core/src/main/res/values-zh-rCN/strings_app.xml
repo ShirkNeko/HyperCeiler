@@ -1330,6 +1330,12 @@
     <string name="home_widget_resizable">解除小部件大小限制</string>
     <string name="home_widget_widget_blur_opt">优化小部件背景模糊</string>
     <string name="home_dock">底栏</string>
+    <string name="home_dock_unlock_style">Dock 栏解锁入场动画</string>
+    <string name="home_dock_unlock_style_daybreak">上浮轻落</string>
+    <string name="home_dock_unlock_style_depth_flip">纵深翻入</string>
+    <string name="home_dock_unlock_style_gale">侧向摆入</string>
+    <string name="home_dock_unlock_style_orbit_sweep">轨道掠入</string>
+    <string name="home_dock_unlock_style_ripple">收拢归位</string>
     <string name="home_dock_bg_enable">添加 Dock 栏背景</string>
     <string name="home_dock_bg_all_app">兼容抽屉模式</string>
     <string name="home_dock_bg_all_app_more">开启可防止 Dock 被截断，但是 Dock 高度会被限制</string>

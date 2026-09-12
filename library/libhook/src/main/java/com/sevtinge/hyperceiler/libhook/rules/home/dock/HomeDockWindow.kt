@@ -92,7 +92,8 @@ class HomeDockWindow : BaseHook() {
 
     private data class Settings(
         val enabled: Boolean, val mode: Int, val color: Int, val height: Int,
-        val margin: Int, val bottom: Int, val radius: Int, val nightMode: Int
+        val margin: Int, val bottom: Int, val radius: Int, val nightMode: Int,
+        val revealStyle: DockUnlockReveal.Style
     ) {
         companion object {
             fun read() = Settings(
@@ -103,7 +104,8 @@ class HomeDockWindow : BaseHook() {
                 PrefsBridge.getInt("home_dock_bg_margin_horizontal", 25),
                 PrefsBridge.getInt("home_dock_bg_margin_bottom", 15),
                 PrefsBridge.getInt("home_dock_bg_radius", 30),
-                PrefsBridge.getStringAsInt("home_other_home_mode", 0)
+                PrefsBridge.getStringAsInt("home_other_home_mode", 0),
+                DockUnlockReveal.Style.of(PrefsBridge.getString("home_dock_unlock_style", "daybreak"))
             )
         }
         val blur get() = mode == 1 || mode == DockGlassPreset.MODE
@@ -135,7 +137,9 @@ class HomeDockWindow : BaseHook() {
         var x: Float = Float.NaN, var y: Float = Float.NaN,
         val reveal: DockUnlockReveal = DockUnlockReveal(),
         var width: Int = 0, var height: Int = 0,
-        var revealScale: Float = 1f, var revealAlpha: Float = 1f) {
+        var revealScale: Float = 1f, var revealAlpha: Float = 1f, var revealSlide: Float = 0f,
+        /** When the current glass host died, so its replacement is rate limited. */
+        var glassDroppedAt: Long = 0L) {
         /** Drop every cached native identity/sample after the launcher Session changed. */
         fun resetNativeMotion() {
             nativeMotion.reset()
@@ -198,7 +202,8 @@ class HomeDockWindow : BaseHook() {
     private data class ScheduledFrame(val epoch: Long, val clock: FrameClock,
         val callback: Choreographer.FrameCallback)
     /** One background transform for one frame. Scale and alpha are 1 unless the reveal is live. */
-    private data class FrameUpdate(val layer: Layer, val y: Float, val scale: Float, val alpha: Float)
+    private data class FrameUpdate(val layer: Layer, val y: Float, val scale: Float, val alpha: Float,
+        val slide: Float)
     private val frameEpoch = AtomicLong(0)
     private val scheduledFrameEpoch = AtomicLong(0)
     private val scheduledFrameStartedNs = AtomicLong(0)
@@ -223,6 +228,8 @@ class HomeDockWindow : BaseHook() {
     // channels mean the display pipeline is fundamentally unhappy with us, so past
     // this point direct motion stays off until the next system_server lifetime.
     private val FRAME_CLOCK_ABANDON_CAP = 4
+    /** Minimum gap between replacing a dead glass host, so a crash loop cannot spin. */
+    private val GLASS_REBUILD_BACKOFF_MS = 2_000L
 
     override fun init() {
         refreshSettings()
@@ -281,10 +288,19 @@ class HomeDockWindow : BaseHook() {
      */
     private fun refreshSettings(): Boolean {
         val latest = runCatching { Settings.read() }.getOrNull() ?: return false
-        if (latest == settings) return false
-        settings = latest
-        glassClient.record("prefs applied enabled=${latest.enabled} mode=${latest.mode} " +
-            "height=${latest.height} margin=${latest.margin} bottom=${latest.bottom} radius=${latest.radius}")
+        // The provider reads the file the settings UI wrote, so it is the source of truth for
+        // the reveal style; the remote snapshot system_server sees can be stale for a whole
+        // process lifetime when the daemon's push is lost.
+        val live = glassClient.liveRevealStyle()
+        val resolved = if (live == null) latest
+            else latest.copy(revealStyle = DockUnlockReveal.Style.of(live))
+        if (resolved == settings) return false
+        settings = resolved
+        // A style change must reach already-built layers; new layers read it at creation.
+        synchronized(layers) { layers.values.forEach { it.reveal.setStyle(resolved.revealStyle) } }
+        glassClient.record("prefs applied enabled=${resolved.enabled} mode=${resolved.mode} " +
+            "height=${resolved.height} margin=${resolved.margin} bottom=${resolved.bottom} " +
+            "radius=${resolved.radius} reveal=${resolved.revealStyle.name.lowercase()}")
         return true
     }
 
@@ -353,6 +369,8 @@ class HomeDockWindow : BaseHook() {
             // Only launcher windows reach this point, so this is the cheapest place to pick up a
             // changed parameter. It is what makes an edit survive a desktop restart: the restart
             // rebuilds the WindowState and traverses into here, but it never re-creates the hook.
+            // The style query is asynchronous and throttled; its result lands on a later traversal.
+            glassClient.refreshRevealStyle()
             refreshSettings()
             val title = attrs.title.toString()
             synchronized(layers) {
@@ -613,8 +631,11 @@ class HomeDockWindow : BaseHook() {
                 // The reveal's pivot compensation rides along, otherwise a traversal landing
                 // mid-reveal would drop it and visibly shift the dock.
                 val shift = pivotOffset(layer.revealScale)
+                // The slide is added at write time and never cached, so layer.x stays the
+                // resting position and the frame loop below cannot apply it twice.
                 transaction.callMethod(SET_POSITION, layer.effect,
-                    x + layer.width * shift, y + layer.height * shift)
+                    x + layer.width * shift + layer.reveal.slidePx(layer.width.toFloat(), now),
+                    y + layer.height * shift)
                 layer.x = x
                 layer.y = y
                 // TODO(twitch-diag): trace traversal writes right after an unlock.
@@ -636,9 +657,20 @@ class HomeDockWindow : BaseHook() {
             // "samples two different wallpapers" flash. One rebuild happens after the window.
             val settledDark = if (materialSettleActive() && layer.glass != null) layer.glass!!.dark else dark
             val glassKey = "${bounds.width()}/${bounds.height()}/${bounds.radius()}/$settledDark"
-            if (!config.glass || layer.glass?.key?.let { it != glassKey } == true) {
+            // A dead host has to be replaced by us: nothing else clears the reference, so without
+            // this the dock stays on the compositor fallback for the rest of the window's life
+            // after the renderer process dies (it is the module's own process, so a swipe-away or
+            // an out-of-memory kill is enough). The backoff keeps a crash-looping renderer from
+            // being restarted on every traversal.
+            val dead = layer.glass?.dead == true
+            if (dead && layer.glassDroppedAt == 0L) layer.glassDroppedAt = SystemClock.uptimeMillis()
+            if (dead && SystemClock.uptimeMillis() - layer.glassDroppedAt < GLASS_REBUILD_BACKOFF_MS) {
+                return layer.glass
+            }
+            if (!config.glass || dead || layer.glass?.key?.let { it != glassKey } == true) {
                 layer.glass?.let { glassClient.release(it) }
                 layer.glass = null
+                layer.glassDroppedAt = 0L
             }
             if (config.glass && visible && layer.glass == null) {
                 val context = service!!.getObjectFieldAs<Context>("mContext")
@@ -659,6 +691,7 @@ class HomeDockWindow : BaseHook() {
                 try { tint = Surfaces.buildLayer("HyperCeiler Dock tint", effect, true) }
                 finally { if (tint == null) Surfaces.destroySurface(effect) }
                 layer = Layer(parent, effect, tint)
+                layer.reveal.setStyle(settings.revealStyle)
                 val now = SystemClock.uptimeMillis()
                 if (DockUnlockReveal.acceptsPending(pendingRevealAt, now)) {
                     layer.reveal.arm(pendingRevealAt)
@@ -813,7 +846,7 @@ class HomeDockWindow : BaseHook() {
             if (hooked) {
                 glassClient.record(
                     "unlock reveal trigger ready ${method.toGenericString()} " +
-                        "phase=going-away pose=single-clock-v2 style=lift-settle-v3")
+                        "phase=going-away pose=single-clock-v2 style=depth-flip-v1")
                 return
             }
             glassClient.record("unlock reveal hook failed $className#$methodName")
@@ -859,7 +892,15 @@ class HomeDockWindow : BaseHook() {
             }
             // Even with no existing layer, retain the event for obtainLayer and run the safety net.
             glassClient.record("unlock reveal transition-start layers=$armed uptimeMs=$pendingRevealAt " +
-                "durationMs=${DockUnlockReveal.DURATION_MS} riseDp=${DockUnlockReveal.RISE_DP} style=lift-settle-v3")
+                "durationMs=${DockUnlockReveal.DURATION_MS} riseDp=${DockUnlockReveal.RISE_DP} " +
+                "reveal=${settings.revealStyle.name.lowercase()}")
+            // Hand the epoch to the glass view: the tilt is a real perspective projection but
+            // it has to happen inside our own process, so it needs the absolute start time.
+            synchronized(layers) {
+                layers.values.forEach { layer ->
+                    layer.glass?.let { glassClient.notifyUnlock(it, pendingRevealAt, settings.revealStyle) }
+                }
+            }
             // Pose the layers now, so the frame where the dock first becomes visible is already
             // the animation's first frame instead of one flash at the resting size.
             if (directMotionAvailable) scheduleAnimationFrame(true) else {
@@ -1064,17 +1105,20 @@ class HomeDockWindow : BaseHook() {
                             || (!layer.nativeApplied && layer.motion.isRunning(now))) needsFrame = true
                         val scale = layer.reveal.scale(now)
                         val alpha = layer.reveal.alpha(now)
+                        // The horizontal slide is part of the same gesture as the lift, so it
+                        // must keep the frame loop dirty even once opacity and scale settle.
+                        val slide = layer.reveal.slidePx(layer.width.toFloat(), now)
                         if (layer.x.isFinite() && layer.baseY > 0 &&
                             (y != layer.y || scale != layer.revealScale ||
-                                alpha != layer.revealAlpha ||
+                                alpha != layer.revealAlpha || slide != layer.revealSlide ||
                                 (layer.reveal.hasPendingPose() && !layer.reveal.isRunning()))) {
-                            frames.add(FrameUpdate(layer, y, scale, alpha))
+                            frames.add(FrameUpdate(layer, y, scale, alpha, slide))
                         }
                     }
                     if (frames.isNotEmpty()) {
                         val transaction = motionTransaction ?: loadClass(TRANSACTION)
                             .getConstructor().newInstance().also { motionTransaction = it }
-                        for ((layer, y, scale, alpha) in frames) {
+                        for ((layer, y, scale, alpha, slide) in frames) {
                             // Scale and alpha are written only when they change, so the reveal can
                             // share one transaction with the real-time follow. The position always
                             // carries the pivot compensation, which is zero once scale reaches 1.
@@ -1082,13 +1126,14 @@ class HomeDockWindow : BaseHook() {
                             if (alpha != layer.revealAlpha) transaction.callMethod("setAlpha", layer.effect, alpha)
                             val shift = pivotOffset(scale)
                             transaction.callMethod(SET_POSITION, layer.effect,
-                                layer.x + layer.width * shift, y + layer.height * shift)
+                                layer.x + layer.width * shift + slide,
+                                y + layer.height * shift)
                             // TODO(twitch-diag): trace frame-loop writes right after an unlock.
                             if (revealDebugActive() && (alpha != layer.revealAlpha ||
                                 SystemClock.uptimeMillis() - lastFrameDbgUptime > 40L)) {
                                 lastFrameDbgUptime = SystemClock.uptimeMillis()
                                 glassClient.record("reveal dbg frame yOff=${y - layer.baseY} " +
-                                    "alpha=$alpha nativeApplied=${layer.nativeApplied}")
+                                    "slide=$slide alpha=$alpha nativeApplied=${layer.nativeApplied}")
                             }
                         }
                         transaction.callMethod("setAnimationTransaction")
@@ -1096,10 +1141,11 @@ class HomeDockWindow : BaseHook() {
                             frameClock.choreographer.callMethod("getVsyncId") as Long)
                         transaction.callMethod("apply")
                         // Publish cached positions only after a successful submission.
-                        for ((layer, y, scale, alpha) in frames) {
+                        for ((layer, y, scale, alpha, slide) in frames) {
                             layer.y = y
                             layer.revealScale = scale
                             layer.revealAlpha = alpha
+                            layer.revealSlide = slide
                             layer.reveal.onPoseCommitted(layer.motionTime)
                             recordMotion(layer, y, layer.motionTime, true, "vsync")
                         }

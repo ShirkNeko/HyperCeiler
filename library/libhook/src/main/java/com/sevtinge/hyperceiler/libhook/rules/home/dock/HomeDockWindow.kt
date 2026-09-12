@@ -65,6 +65,14 @@ class HomeDockWindow : BaseHook() {
          * 120Hz, so 8ms keeps the row in step with it without owning a DisplayEventReceiver.
          */
         const val FRAME_INTERVAL_MS = 8L
+        /**
+         * Title prefix of the launcher's overlay window - the minus-one screen. The launcher
+         * names the window itself (the string never appears in services.jar), and WMS owns it,
+         * so it is the one launcher state this process can observe.
+         */
+        const val LAUNCHER_OVERLAY_TITLE = "LauncherOverlayWindow"
+        /** Minimum gap between window-map scans while the overlay is not known to be showing. */
+        const val OVERLAY_SCAN_MS = 50L
         const val NATIVE_BIND_SWEEP_MS = 1_000L
         /** Reveal (821ms) plus a margin for the keyguard/home wallpaper swap to settle. */
         const val MATERIAL_SETTLE_MS = 1_600L
@@ -132,6 +140,8 @@ class HomeDockWindow : BaseHook() {
         var overviewGeneration: Long = 0, var nativeOverviewGeneration: Long = 0,
         var lastOverviewValidationNs: Long = 0,
         var lastVisible: Boolean? = null,
+        /** True while the launcher's overlay (minus-one screen) is what keeps this layer hidden. */
+        var overlayHidden: Boolean = false,
         var lastGlassReady: Boolean? = null,
         var motionSession: Any? = null, var motionClient: IBinder? = null,
         var motionSamples: Int = 0, var motionEndPending: Boolean = false,
@@ -223,6 +233,11 @@ class HomeDockWindow : BaseHook() {
     private var motionTransaction: Any? = null
     private var scheduledFrame: ScheduledFrame? = null
     private var directRecoveryDelay = 100L
+    // Display thread only. Cached overlay WindowState and its last observed visibility; see
+    // launcherOverlayVisible(). The overlay outlives a page change but not a launcher restart.
+    private var overlayWindow: Any? = null
+    private var overlayScannedAt = 0L
+    private var overlayVisible = false
     /** Minimum gap between replacing a dead glass host, so a crash loop cannot spin. */
     private val GLASS_REBUILD_BACKOFF_MS = 2_000L
 
@@ -571,7 +586,19 @@ class HomeDockWindow : BaseHook() {
                 else -> configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
             }
             val windowVisible = window.callMethod("isVisible") == true
-            val visible = windowVisible
+            // The launcher hides its own dock while the minus-one screen is showing, and our
+            // panel would then be the only thing left floating over it. Everything downstream
+            // already keys off `visible` - the appearance transaction hides the effect layer,
+            // the glass refresh is paused and the frame loop stops - so folding the overlay into
+            // this one flag is what makes the hide (and the restore) automatic.
+            val overlayShowing = launcherOverlayVisible(service!!, SystemClock.uptimeMillis())
+            if (overlayShowing != layer.overlayHidden) {
+                layer.overlayHidden = overlayShowing
+                glassClient.record(
+                    if (overlayShowing) "dock glass hidden for launcher overlay (minus-one)"
+                    else "dock glass restored after launcher overlay")
+            }
+            val visible = windowVisible && !overlayShowing
             val wasVisible = layer.lastVisible == true
             bindNativeMotion(window, layer)
             if (!visible) {
@@ -1303,6 +1330,52 @@ class HomeDockWindow : BaseHook() {
         return layer.motion.offsetY(layer.density, layer.baseY, now)
     }
 
+
+    /**
+     * Whether the launcher's overlay window - the minus-one screen - is currently visible.
+     *
+     * <p>Read straight from WMS's window map, on the display thread and under the same global
+     * lock as every other traversal write. This is deliberately the only launcher state we read:
+     * OS4's launcher is a Flutter application with no dex at all, so edit mode and the pages
+     * themselves live in Dart and no Java hook can reach them, while the overlay is a real
+     * WindowState that WMS owns.
+     *
+     * <p>The visible case short-circuits on the cached state. Otherwise the map is re-scanned at
+     * most every [OVERLAY_SCAN_MS]: the overlay survives page changes, but a launcher restart
+     * replaces the WindowState and the stale one would never report visible again.
+     */
+    private fun launcherOverlayVisible(wm: Any, now: Long): Boolean {
+        val cached = overlayWindow
+        if (cached != null) {
+            val visible = runCatching { cached.callMethod("isVisible") as Boolean }.getOrNull()
+            if (visible == true) {
+                overlayVisible = true
+                return true
+            }
+        }
+        if (now - overlayScannedAt < OVERLAY_SCAN_MS) return overlayVisible
+        overlayScannedAt = now
+        val found = runCatching { findLauncherOverlay(wm) }.onFailure {
+            if (observed.add("launcher-overlay-scan")) {
+                glassClient.record("launcher overlay scan unavailable=${it.javaClass.simpleName}: " +
+                    "${it.message?.take(120)}")
+            }
+        }.getOrNull()
+        overlayWindow = found
+        overlayVisible = found != null &&
+            runCatching { found.callMethod("isVisible") as Boolean }.getOrDefault(false)
+        return overlayVisible
+    }
+
+    private fun findLauncherOverlay(wm: Any): Any? {
+        for (state in wm.getObjectFieldAs<Map<*, *>>("mWindowMap").values) {
+            val name = state?.let {
+                runCatching { it.callMethod("getName") as String }.getOrNull()
+            } ?: continue
+            if (name.startsWith(LAUNCHER_OVERLAY_TITLE)) return state
+        }
+        return null
+    }
 
     private fun hasPendingMotionFrame(): Boolean {
         val now = SystemClock.uptimeMillis()

@@ -559,6 +559,7 @@ class HomeDockWindow : BaseHook() {
             }
             val windowVisible = window.callMethod("isVisible") == true
             val visible = windowVisible
+            val wasVisible = layer.lastVisible == true
             bindNativeMotion(window, layer)
             if (!visible) {
                 layer.motion.finish()
@@ -592,15 +593,17 @@ class HomeDockWindow : BaseHook() {
             val running = !layer.nativeApplied && layer.motion.isRunning(now)
             // In direct mode, do not queue old animation positions in a later WMS traversal.
             // WMS still initializes/repositions our layer when the actual layout changes.
-            val movingDirectly = directMotionAvailable && visible && running
-            val keepDirectPosition = movingDirectly && !geometryChanged
-            // The reveal offset MUST ride along here too: while a reveal is running the frame loop
-            // writes baseY+offset+risePx every vsync, and a traversal writing the bare resting y
-            // would fight it at display rate - the dock visibly vibrating between two positions.
-            // With the same formula both writers agree, so traversal writes become no-ops.
+            val movingDirectly = directMotionAvailable && visible && (running ||
+                layer.reveal.isRunning() || layer.reveal.hasPendingPose() ||
+                layer.revealAlpha != 1f || layer.revealScale != 1f)
+            val keepDirectPosition = movingDirectly && wasVisible && !geometryChanged
+            // A WMS sync transaction can be applied after a newer direct vsync transaction.
+            // Even the same curve sampled at different times then moves the surface backwards.
+            // Once visible, only the frame clock owns animation pose; traversal still owns
+            // first-show initialization, real geometry changes and the non-direct fallback.
             val y = if (keepDirectPosition) layer.y
                 else bounds.y() + offset + layer.reveal.risePx(layer.density, now)
-            if (visible && running) scheduleAnimationFrame()
+            if (visible && (movingDirectly || running || layer.reveal.isRunning())) scheduleAnimationFrame()
             val moved = layer.x != x || layer.y != y
             if (!moved && layer.appearance == appearance.key) return
             val transaction = window.callMethod("getSyncTransaction")!!
@@ -622,7 +625,7 @@ class HomeDockWindow : BaseHook() {
                 recordMotion(layer, y, now, visible, "layout")
             }
             if (layer.appearance == appearance.key) return
-            applyAppearance(transaction, layer, appearance)
+            applyAppearance(transaction, layer, appearance, keepDirectPosition)
             layer.appearance = appearance.key
         }
 
@@ -694,7 +697,8 @@ class HomeDockWindow : BaseHook() {
             return layer
         }
 
-        private fun applyAppearance(transaction: Any, layer: Layer, appearance: Appearance) {
+        private fun applyAppearance(transaction: Any, layer: Layer, appearance: Appearance,
+            keepDirectPosition: Boolean) {
             val (config, bounds, dark, visible, glass) = appearance
             val glassSurface = appearance.surface
             val glassReady = appearance.ready
@@ -731,10 +735,14 @@ class HomeDockWindow : BaseHook() {
             // The layer can become visible before the reveal's first animation frame runs. Pose it
             // inside this very transaction, otherwise the dock is drawn once at its resting size
             // and only then flies in - the "shows first, animates after" artefact.
-            if (layer.reveal.isRunning()) {
-                applyRevealPose(transaction, layer, SystemClock.uptimeMillis())
-            } else if (layer.revealAlpha != 1f || layer.revealScale != 1f) {
-                restoreRestingTransform(transaction, layer)
+            // Material changes must not enqueue an old animation pose behind a newer frame.
+            if (!keepDirectPosition) {
+                if (layer.reveal.isRunning()) {
+                    applyRevealPose(transaction, layer, SystemClock.uptimeMillis())
+                } else if (layer.reveal.hasPendingPose() ||
+                    layer.revealAlpha != 1f || layer.revealScale != 1f) {
+                    restoreRestingTransform(transaction, layer)
+                }
             }
             val appliedGlass = glassReady && glass?.dead == false
             if (config.glass && layer.lastGlassReady != appliedGlass) {
@@ -804,7 +812,8 @@ class HomeDockWindow : BaseHook() {
             }.isSuccess
             if (hooked) {
                 glassClient.record(
-                    "unlock reveal trigger ready ${method.toGenericString()} phase=going-away")
+                    "unlock reveal trigger ready ${method.toGenericString()} " +
+                        "phase=going-away pose=single-clock-v2")
                 return
             }
             glassClient.record("unlock reveal hook failed $className#$methodName")
@@ -834,9 +843,8 @@ class HomeDockWindow : BaseHook() {
             synchronized(wm.getObjectFieldAs<Any>(WM_LOCK)) {
                 synchronized(layers) {
                     val now = SystemClock.uptimeMillis()
-                    if (!DockUnlockReveal.acceptsPending(pendingRevealAt, now)) {
-                        pendingRevealAt = now
-                    }
+                    if (!DockUnlockReveal.acceptsNewEvent(pendingRevealAt, now)) return
+                    pendingRevealAt = now
                     layers.values.forEach {
                         if (it.reveal.arm(now)) {
                             // Keep the clock aligned with transition start even if WMS still
@@ -979,7 +987,8 @@ class HomeDockWindow : BaseHook() {
                 synchronized(layers) {
                     val now = SystemClock.uptimeMillis()
                     val stale = layers.values.filter {
-                        it.reveal.isStalled(now) && (it.revealScale != 1f || it.revealAlpha != 1f)
+                        it.reveal.isStalled(now) && (it.reveal.hasPendingPose() ||
+                            it.revealScale != 1f || it.revealAlpha != 1f)
                     }
                     if (stale.isEmpty()) return
                     val transaction = motionTransaction ?: loadClass(TRANSACTION)
@@ -989,6 +998,7 @@ class HomeDockWindow : BaseHook() {
                         restoreRestingTransform(transaction, it)
                     }
                     transaction.callMethod("apply")
+                    stale.forEach { it.reveal.onPoseCommitted(now) }
                     glassClient.record("unlock reveal force reset layers=${stale.size}")
                 }
             }
@@ -1055,7 +1065,8 @@ class HomeDockWindow : BaseHook() {
                         val alpha = layer.reveal.alpha(now)
                         if (layer.x.isFinite() && layer.baseY > 0 &&
                             (y != layer.y || scale != layer.revealScale ||
-                                alpha != layer.revealAlpha)) {
+                                alpha != layer.revealAlpha ||
+                                (layer.reveal.hasPendingPose() && !layer.reveal.isRunning()))) {
                             frames.add(FrameUpdate(layer, y, scale, alpha))
                         }
                     }
@@ -1088,6 +1099,7 @@ class HomeDockWindow : BaseHook() {
                             layer.y = y
                             layer.revealScale = scale
                             layer.revealAlpha = alpha
+                            layer.reveal.onPoseCommitted(layer.motionTime)
                             recordMotion(layer, y, layer.motionTime, true, "vsync")
                         }
                     }
@@ -1347,7 +1359,12 @@ class HomeDockWindow : BaseHook() {
         val now = SystemClock.uptimeMillis()
         return synchronized(layers) {
             layers.values.any { layer ->
-                layer.reveal.needsFrame(now)
+                // Clock expiry does not submit the resting pose. Keep the terminal frame
+                // pending across repeated lost callbacks, including a rise-only residue.
+                val revealNeedsFrame = layer.reveal.needsFrame(now)
+                revealNeedsFrame || (layer.lastVisible == true &&
+                    (layer.reveal.hasPendingPose() ||
+                        layer.revealAlpha != 1f || layer.revealScale != 1f))
                     || nativeMotionEndpoint.latest(layer.nativeUid, layer.nativePid) != null
                     || (layer.nativeApplied && !layer.overview)
                     || (!layer.nativeApplied && layer.motion.isRunning(now))

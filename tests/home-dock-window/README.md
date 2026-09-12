@@ -59,6 +59,7 @@ javac -d "$dock_test_dir" \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockWindowPolicy.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassPreset.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockRecentsMotion.java \
+  library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockUnlockReveal.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassRetryPolicy.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassSurfaceLease.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassProcessPolicy.java \
@@ -72,6 +73,7 @@ javac -d "$dock_test_dir" \
   tests/home-dock-window/DockWindowPolicyTest.java \
   tests/home-dock-window/DockGlassPresetTest.java \
   tests/home-dock-window/DockRecentsMotionTest.java \
+  tests/home-dock-window/DockUnlockRevealTest.java \
   tests/home-dock-window/DockGlassRetryPolicyTest.java \
   tests/home-dock-window/DockGlassSurfaceLeaseTest.java \
   tests/home-dock-window/DockGlassProcessPolicyTest.java \
@@ -79,12 +81,33 @@ javac -d "$dock_test_dir" \
   tests/home-dock-window/DockNativeMotionTest.java \
   tests/home-dock-window/DockNativeMotionEndpointTest.java \
   tests/home-dock-window/DockGlassRecoveryGateTest.java
-for test in DockWindowPolicy DockGlassPreset DockRecentsMotion DockGlassRetryPolicy DockGlassSurfaceLease DockGlassProcessPolicy DockWallpaperEndpoint DockNativeMotion DockNativeMotionEndpoint DockGlassRecoveryGate; do
+for test in DockWindowPolicy DockGlassPreset DockRecentsMotion DockUnlockReveal DockGlassRetryPolicy DockGlassSurfaceLease DockGlassProcessPolicy DockWallpaperEndpoint DockNativeMotion DockNativeMotionEndpoint DockGlassRecoveryGate; do
   java -cp "$dock_test_dir" "com.sevtinge.hyperceiler.tests.dock.${test}Test"
 done
 ```
 
 ## Required device verification (not covered by host tests)
+
+Unlock reveal uses the early `keyguardGoingAway(int)` epoch. A late-created/visible
+layer joins that epoch instead of replaying from zero. Repeated transition callbacks
+use the same 1221ms restart guard for both existing layers and the pending epoch.
+In direct mode, already-visible layers keep animation position/alpha/matrix writes
+on the frame clock; ordinary WMS material traversals must not queue an older pose.
+First-show and actual geometry changes still carry their pose in WMS's transaction.
+`DockUnlockRevealTest` checks epoch alignment, duplicate events, expiry while hidden,
+rapid successive unlocks, and uptime-zero boundaries. It does not validate SurfaceFlinger
+transaction order or the actual Flutter icon trajectory.
+Clock expiry is separate from final-pose submission: a persistent pending-pose flag
+survives repeated lost callbacks and is cleared only after submitting the resting pose.
+The tests also cover rise-only residue after opacity reaches one, cancelled reveals,
+and retrying the terminal frame without falsely acknowledging an unsubmitted pose.
+
+After loading the new system hook, verify `phase=going-away pose=single-clock-v2`.
+Test fingerprint unlock from doze and unlock from the lit lock screen, including
+repeated unlocks and a launcher-surface recreation. Record whether the Dock flashes at
+rest before moving or moves backward mid-flight. Host tests and an APK install alone
+do not prove these visual results. The 821ms rise/fade remains a local approximation,
+not per-frame sampling of Flutter's staggered 3D unlock animation.
 
 1. Install the APK, enable the System Framework scope, and reboot the device.
 2. Enable Dock background; select system material. Confirm `HomeDockWindow` logs contain

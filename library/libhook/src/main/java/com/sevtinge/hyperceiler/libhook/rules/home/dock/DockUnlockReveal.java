@@ -30,9 +30,9 @@ package com.sevtinge.hyperceiler.libhook.rules.home.dock;
  * identity on this ROM, so they cannot be mirrored either.
  *
  * <p>A child SurfaceControl cannot join a transform that is rasterised inside the launcher's own
- * buffer, so the reveal is reproduced here instead: the background grows, rises and fades in over
+ * buffer, so the reveal is approximated here instead: the background rises and fades in over
  * the same measured window (821 ms, {@code _showPresent} -&gt; {@code endAnimation}) starting from
- * the same moment the platform stops showing the keyguard.
+ * the platform's early {@code keyguardGoingAway} transition, not its later visibility callback.
  *
  * <p>This type is deliberately free of framework references so the timing stays testable.
  */
@@ -69,8 +69,9 @@ public final class DockUnlockReveal {
 
     private boolean armed;
     private boolean running;
+    private boolean pendingPose;
     private long armedAt;
-    private long startedAt;
+    private long startedAt = -1L;
 
     /** A late-created surface may join this unlock, but not an old or future event. */
     public static boolean acceptsPending(long eventMillis, long nowMillis) {
@@ -78,17 +79,27 @@ public final class DockUnlockReveal {
                 && nowMillis - eventMillis <= EXPIRY_MS;
     }
 
+    /** Use one duplicate-event window for existing surfaces and late-created surfaces. */
+    public static boolean acceptsNewEvent(long previousMillis, long nowMillis) {
+        return nowMillis >= 0L && (previousMillis < 0L
+                || (nowMillis >= previousMillis && nowMillis - previousMillis >= RESTART_GUARD_MS));
+    }
+
     /**
-     * Keyguard has gone: the next frame where the dock is on screen starts the reveal.
+     * Record the transition epoch. A visible frame joins this clock; it never starts a new clock.
      *
      * @return true when this call armed the reveal, false when one was already armed, running, or
      *     finished too recently to be a new unlock.
      */
     public boolean arm(long nowMillis) {
+        // Hidden layers do not call progress(). Expire their previous animation here too,
+        // otherwise a completed but unsampled reveal rejects the next real unlock.
+        needsFrame(nowMillis);
         if (armed || running) return false;
-        if (startedAt != 0L && nowMillis - startedAt < RESTART_GUARD_MS) return false;
+        if (!acceptsNewEvent(startedAt, nowMillis)) return false;
         armed = true;
         armedAt = nowMillis;
+        pendingPose = true;
         return true;
     }
 
@@ -99,7 +110,7 @@ public final class DockUnlockReveal {
     }
 
     /**
-     * Consume a pending arm. The caller only reaches this on a visible dock frame.
+     * Consume a pending arm without shifting its transition epoch to the visibility time.
      *
      * @return true when this call started the clock, so the caller can report the exact moment the
      *     dock first became animatable.
@@ -112,13 +123,25 @@ public final class DockUnlockReveal {
         }
         armed = false;
         running = true;
-        startedAt = nowMillis;
+        startedAt = armedAt;
         return true;
     }
 
     /** True while the reveal still owes the caller a transform, including the armed wait. */
     public boolean isRunning() {
         return armed || running;
+    }
+
+    /** Clock expiry alone cannot prove that the resting position/opacity reached the surface. */
+    public boolean hasPendingPose() {
+        return pendingPose;
+    }
+
+    /** Acknowledge only after successfully submitting the pose sampled at this timestamp. */
+    public void onPoseCommitted(long nowMillis) {
+        if (!armed && (!running || nowMillis - startedAt >= DURATION_MS)) {
+            pendingPose = false;
+        }
     }
 
     /**
@@ -140,6 +163,9 @@ public final class DockUnlockReveal {
         if (armed && nowMillis - armedAt > EXPIRY_MS) {
             cancel();
             return false;
+        }
+        if (running && nowMillis >= startedAt && nowMillis - startedAt >= DURATION_MS) {
+            running = false;
         }
         return isRunning();
     }

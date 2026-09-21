@@ -56,6 +56,6 @@
     <color name="headtip_notice_text_color">#FFFFCF7A</color>
     <color name="headtip_tip_color">#FF132A46</color>
     <color name="headtip_tip_text_color">#FF87BEFF</color>
-    <color name="headtip_warn_color">#FF310808</color>
-    <color name="headtip_warn_text_color">#FFF72727</color>
+    <color name="headtip_warn_color">#FF132A46</color>
+    <color name="headtip_warn_text_color">#FF87BEFF</color>
 </resources>

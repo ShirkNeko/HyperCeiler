@@ -180,9 +180,9 @@ public class HomePageBannerManager {
 
     private static BannerBean createWarningBannerIfNeeded(Context context) {
         if (!SignUtils.isSignCheckPass(context)) {
-            return createWarningBanner(
+            return createInfoTipBanner(
                 "warning_sign",
-                context.getString(R.string.headtip_warn_sign_verification_failed),
+                context.getString(R.string.headtip_tip_trusted_third_party),
                 null
             );
         }
